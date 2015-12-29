@@ -1,0 +1,257 @@
+import os
+import sys
+import socket
+import select
+import pickle
+import multiprocessing as mp
+from ccstructs import *
+HOST = ''
+PORT = 7653  # Ctrl port
+UDP_START = 7655
+HB_INTVAL = 10  # Heartbeat every 10 seconds
+
+BUFSIZE = 4096
+DATASIZE = 5120000
+
+CLIENT_EXPIRE = 60  # Client is expired if no heartbeat for long
+SESSION_EXPIRE = 60  # Session expires when idle for long time (in seconds)
+
+"""
+Server maintains a bunch of sessions, each of which corresponds to a child
+process serving some segment of a file. Sessions are maintained in a dict:
+{('filename', segmentid) : (Session, Process)}
+
+"""
+sessions = {}
+
+
+def send_file_meta(conn, filename):
+    """
+    Send meta information of a given filename
+    """
+    if not os.path.isfile(filename):
+        pkt = Packet(MSG['ERR_NOFILE'])
+        conn.send(pickle.dumps(pkt))
+    else:
+        meta = MetaInfo(filename)
+        meta.fill_info()
+        pkt = Packet(MSG['FILEMETA'], meta)
+        conn.send(pickle.dumps(pkt))
+
+
+def find_session(sessions, segmeta):
+    """
+    Find existing session with segment metainfo.
+    If exists, return the session;
+    Otherwise, return None
+    """
+    if (segmeta.filename, segmeta.segmentid) in sessions.keys():
+        return sessions[(segmeta.filename, segmeta.segmentid)][0]
+    else:
+        return None
+
+
+def create_new_session(sessions, segmeta):
+    """
+    Create a new session with the given segment metainfo.
+    A child process is forked dedicating to the session.
+    """
+    # Find an available session id
+    new_sid = 0
+    while new_sid in [s[0].meta.sessionid for s in sessions.values()]:
+        new_sid += 1
+    # Create meta and fill in information of the file
+    meta = MetaInfo(segmeta.filename, segmeta.segmentid, new_sid)
+    meta.fill_info()
+    # Fork a child process and build pipe between parent and child
+    session = Session(meta)
+    (fdp, fdc) = mp.Pipe()
+    session.fdp = fdp
+    session.fdc = fdc
+    print("New session created, ID: ", new_sid)
+    # Fork a process to serve the clients of the session
+    child = mp.Process(target=session_main, args=(session, ))
+    child.start()
+    session.fdc.close()  # Close parent's fdc
+    sessions[(segmeta.filename, segmeta.segmentid)] = (session, child)
+    return session
+
+
+def call_session_process(session, msg):
+    """
+    Call the session process, which is a child process of the main process
+    """
+    # print("Send packet to session process")
+    session.fdp.send(msg)
+    try:
+        reply = session.fdp.recv()
+        # print("Receive reply from session process")
+        if reply.mtype == MSG['OK']:
+            return 0
+        else:
+            return -1
+    except EOFError:
+        return -1
+
+
+def housekeeping():
+    """ Housekeeping tasks of the parent process
+        - Clean exited session from sessions list
+    """
+    exited = []
+    for k in sessions.keys():
+        if not sessions[k][1].is_alive():
+            print("Session [", sessions[k][0].meta.sessionid,
+                  "] of ", k, " is expired.")
+            sessions[k][1].join()
+            exited.append(k)
+    for k in exited:
+        del sessions[k]
+
+
+def handle_ctrl_packet(conn, pkt):
+    """
+    Server main
+    """
+    global sessions
+    # print("Message type: ", pkt.header.op)
+    session = find_session(sessions, pkt.payload)
+    ip, port = conn.getpeername()
+    if pkt.mtype == MSG['CHK_FILE']:
+        send_file_meta(conn, pkt.payload.filename)
+    elif pkt.mtype == MSG['REQ_SEG']:
+        if session is None:
+            # Fix: cannot create too many sessions. Need to impose a limit
+            # ERR_MAXFILE will be send if maximum sessions reached
+            session = create_new_session(sessions, pkt.payload)
+        ret = call_session_process(session, (pkt, ip))
+        if ret is 0:
+            pkt = Packet(MSG['SESSIONMETA'], session.meta)
+            conn.send(pickle.dumps(pkt))  # Send session's data
+            pkt = pickle.loads(conn.recv(BUFSIZE))  # Get client's reply
+            if pkt.mtype == MSG['OK']:
+                # Add to client list of the session
+                print("Add ", ip, "into client list")
+                session.add_client(HostInfo(ip))
+        else:
+            print("Call_cession_process return -1")
+    elif pkt.mtype == MSG['HEARTBEAT']:
+        if session is None:
+            # No such session, error notice
+            pass
+        else:
+            ret = call_session_process(session, (pkt, ip))
+            if ret is 0:
+                conn.send(pickle.dumps(pkt))  # Echo back the heartbeat
+            else:
+                # Session no reply, error notice
+                pass
+    elif pkt.mtype == MSG['REQ_STOP']:
+        # remove client from session
+        if session is None:
+            # No such session, error notice to client
+            pass
+        else:
+            ret = call_session_process(session, (pkt, ip))
+            if ret is 0:
+                conn.send(pickle.dumps(Packet(MSG['OK'])))
+                session.remove_client(ip)
+            else:
+                # Child no reply, error notice to client
+                pass
+
+
+def handle_ctrl_packet_child(session, pkt):
+    """
+    Child process handle control packet passed from parent process
+    """
+    pass
+
+
+def session_main(session):
+    """
+    Main loop of the child process of each session.
+    This routine never exit
+    """
+    session.pid = os.getpid()
+    session.fdp.close()  # Close fdp on child side
+    if session.datasock is None:
+        # Create session's data socket and load file
+        session.datasock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        session.load_file()
+        print("Child process finish loading file")
+    port = UDP_START + session.meta.sessionid  # Port used by the session
+    poller = select.poll()  # poll fdc and datasock
+    poller.register(session.fdc.fileno(), select.POLLIN)
+    poller.register(session.datasock.fileno(), select.POLLOUT)
+    pkt_p = snc.snc_alloc_empty_packet(snc.snc_get_metainfo(session.sc))
+    while True:
+        for fd, event in poller.poll():
+            if fd == session.fdc.fileno() and event is select.POLLIN:
+                pkt, ip = session.fdc.recv()
+                print("Session [%d] receives msg of type <%d> from %s " %
+                      (session.meta.sessionid, pkt.mtype, ip))
+                if pkt.mtype == MSG['REQ_SEG']:
+                    session.add_client(HostInfo(ip))
+                    session.fdc.send(Packet(MSG['OK']))
+                elif pkt.mtype == MSG['HEARTBEAT']:
+                    session.fdc.send(Packet(MSG['OK']))
+                elif pkt.mtype == MSG['REQ_STOP']:
+                    session.remove_client(ip)
+                    session.fdc.send(Packet(MSG['OK']))
+            if fd == session.datasock.fileno() and event is select.POLLOUT:
+                # writable datasock, send data packets to clients
+                for cli in session.clients:
+                    snc.snc_generate_packet_im(session.sc, pkt_p)
+                    load = DataLoad()
+                    load.fill_dataload(pkt_p, session.meta.sp)
+                    pkt = Packet(MSG['DATA'], load)  # Compose packet
+                    try:
+                        session.datasock.sendto(pickle.dumps(pkt),
+                                                (cli.ip, port))
+                    except:
+                        print("Caught exception in session ID: ",
+                              session.meta.sessionid)
+                    session.lastIdle = datetime.now()  # Refresh idle time
+        session_housekeeping(session)
+
+
+def session_housekeeping(session):
+    """ Housekeeping of a session
+        - Remove clients that didn't heartbeat for long
+        - Exit if the session has been idle (i.e., no clients) for long
+
+        Fixme:
+          May not be efficient because now() will be called too often.
+    """
+    now = datetime.now()
+    if (now - session.lastClean).seconds > CLIENT_EXPIRE:
+        # Clean up no heartbeat clients
+        for cli in session.clients:
+            if (now - cli.lastBeat).seconds > CLIENT_EXPIRE:
+                print("Remove client ", cli.ip, "because no heartbeat")
+                session.remove_client(cli.ip)
+        session.lastClean = now
+    if (now - session.lastIdle).seconds > SESSION_EXPIRE:
+        session.datasock.close()
+        sys.exit(0)
+
+
+if __name__ == "__main__":
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(5.0)
+    s.bind((HOST, PORT))
+    s.listen(1)
+    while True:
+        housekeeping()
+        try:
+            conn, addr = s.accept()
+            # handle control connections
+            ip = addr[0]
+            # print('Connection from: ', ip)
+            bindata = conn.recv(BUFSIZE)
+            ccpkt = pickle.loads(bindata)
+            handle_ctrl_packet(conn, ccpkt)
+            conn.close()
+        except socket.timeout:
+            continue
