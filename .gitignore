@@ -1,2 +1,3 @@
+pysnc.py
 *.pyc
 __pycache__

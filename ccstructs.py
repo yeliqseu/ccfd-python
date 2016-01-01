@@ -160,48 +160,6 @@ class HostInfo:
         self.lastBeat = lastBeat
 
 
-class DataLoad:
-    """ SNC packet as payload
-        Each packet contains a gid, an array of uint8_t coding coefficients,
-        and an array of uint8_t message symbols.
-    """
-    def __init__(self):
-        self.gid = -1
-        self.coes = []
-        self.syms = []
-
-    def fill_dataload(self, sncpkt_p, sp):
-        """ Set SNCData using an SNC packet from libsnc.so
-
-        :param sncpkt_p: pointer to snc_packet
-        :param sp: snc_parameter
-        """
-        self.gid = sncpkt_p.contents.gid
-        self.coes = []
-        if sp.bnc == 1:
-            for i in range(math.ceil(sp.size_g, 8)):
-                self.coes.append(sncpkt_p.contents.coes[i])
-        else:
-            for i in range(sp.size_g):
-                self.coes.append(sncpkt_p.contents.coes[i])
-        self.syms = []
-        for i in range(sp.size_p):
-            self.syms.append(sncpkt_p.contents.syms[i])
-
-    def parse_dataload(self, sncpkt_p, sp):
-        """ Set pointer of an snc_packet using SNCData
-        """
-        sncpkt_p.contents.gid = self.gid
-        if sp.bnc == 1:
-            for i in range(math.ceil(sp.size_g, 8)):
-                sncpkt_p.contents.coes[i] = self.coes[i]
-        else:
-            for i in range(sp.size_g):
-                sncpkt_p.contents.coes[i] = self.coes[i]
-        for i in range(sp.size_p):
-            sncpkt_p.contents.syms[i] = self.syms[i]
-
-
 class Packet:
     """ Packet format in ccFileD
         mtype   - type of the message delivered in the packet

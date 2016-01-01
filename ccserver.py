@@ -203,12 +203,10 @@ def session_main(session):
                 # writable datasock, send data packets to clients
                 for cli in session.clients:
                     snc.snc_generate_packet_im(session.sc, pkt_p)
-                    load = DataLoad()
-                    load.fill_dataload(pkt_p, session.meta.sp)
-                    pkt = Packet(MSG['DATA'], load)  # Compose packet
+                    pktstr = pkt_p.contents.serialize(session.meta.sp.size_g,
+                                                      session.meta.sp.size_p)
                     try:
-                        session.datasock.sendto(pickle.dumps(pkt),
-                                                (cli.ip, port))
+                        session.datasock.sendto(pktstr, (cli.ip, port))
                     except:
                         print("Caught exception in session ID: ",
                               session.meta.sessionid)
