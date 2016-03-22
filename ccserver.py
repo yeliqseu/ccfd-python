@@ -25,6 +25,50 @@ process serving some segment of a file. Sessions are maintained in a dict:
 sessions = {}
 
 
+class Session:
+    """ Session details
+    """
+    def __init__(self, meta):
+        self.meta = meta      # Metainfo of the session
+        self.sc = snc.snc_create_enc_context(None, byref(self.meta.sp))
+        self.fdp = None       # fd of pipe of the parent side
+        self.fdc = None       # fd of pipe of the child side
+        self.datasock = None  # UDP socket for data transmission
+        self.clients = []     # List of clients in serving in the session
+        self.lastClean = datetime.now()
+        self.lastIdle = datetime.now()
+
+    def load_file(self):
+        """ Load file content into snc context of the session
+            This only happens in the session process (i.e., child).
+        """
+        offset = self.meta.segmentid * DATASIZE
+        filename = self.meta.filename.encode('UTF-8')
+        snc.snc_load_file_to_context(c_char_p(filename), offset, self.sc)
+
+    def add_client(self, cli):
+        """ Add a client to client list
+            cli - client
+        """
+        if self.clients.count(cli) is 0:
+            self.clients.append(cli)
+
+    def has_client(self, ip):
+        """ Check an ip is in client list
+        """
+        for cli in self.clients:
+            if cli.ip == ip:
+                return cli
+        return None
+
+    def remove_client(self, ip):
+        """ Remove the client of the given ip from client list
+        """
+        cli = self.has_client(ip)
+        if cli is not None:
+            self.clients.remove(cli)
+
+
 def send_file_meta(conn, filename):
     """
     Send meta information of a given filename
@@ -34,7 +78,6 @@ def send_file_meta(conn, filename):
         conn.send(pickle.dumps(pkt))
     else:
         meta = MetaInfo(filename)
-        meta.fill_info()
         pkt = Packet(MSG['FILEMETA'], meta)
         conn.send(pickle.dumps(pkt))
 
@@ -62,13 +105,15 @@ def create_new_session(sessions, segmeta):
         new_sid += 1
     # Create meta and fill in information of the file
     meta = MetaInfo(segmeta.filename, segmeta.segmentid, new_sid)
-    meta.fill_info()
+    sp = snc_parameters(meta.segsize, 0.01, 32, 44, 1280, RAND_SNC, 0, 0, 0, -1)
+    meta.set_snc_params(sp)
     # Fork a child process and build pipe between parent and child
     session = Session(meta)
     (fdp, fdc) = mp.Pipe()
     session.fdp = fdp
     session.fdc = fdc
     print("New session created, ID: ", new_sid)
+    print(session.meta)
     # Fork a process to serve the clients of the session
     child = mp.Process(target=session_main, args=(session, ))
     child.start()
@@ -184,7 +229,7 @@ def session_main(session):
     poller = select.poll()  # poll fdc and datasock
     poller.register(session.fdc.fileno(), select.POLLIN)
     poller.register(session.datasock.fileno(), select.POLLOUT)
-    pkt_p = snc.snc_alloc_empty_packet(snc.snc_get_metainfo(session.sc))
+    pkt_p = snc.snc_alloc_empty_packet(snc.snc_get_parameters(session.sc))
     while True:
         for fd, event in poller.poll():
             if fd == session.fdc.fileno() and event is select.POLLIN:

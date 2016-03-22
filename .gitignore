@@ -1,3 +1,4 @@
-pysnc.py
+*.swp
 *.pyc
+libsparsenc.so
 __pycache__

@@ -47,12 +47,19 @@ class MetaInfo:
     """
     def __init__(self, filename, segmentid=-1, sessionid=-1):
         self.filename = filename
+        statinfo = os.stat(self.filename)
+        self.filesize = statinfo.st_size
+        self.numofseg = int(math.ceil(float(self.filesize)/DATASIZE))
         self.segmentid = segmentid
+        if segmentid == self.numofseg - 1:
+            self.segsize = self.filesize - DATASIZE * (self.numofseg - 1)
+        else:
+            self.segsize = DATASIZE
         self.sessionid = sessionid
-        self.filesize = None
         self.sp = None
-        self.segsize = None
-        self.numofseg = None
+
+    def set_snc_params(self, sp):
+        self.sp = sp
 
     def __str__(self):
         str = '<--\n'
@@ -72,80 +79,13 @@ class MetaInfo:
             str += ' size_b: %d, size_g: %d, size_p: %d\n' % (self.sp.size_b,
                                                               self.sp.size_g,
                                                               self.sp.size_p)
-            str += ' code type: %d, bpc: %d, bnc: %d\n' % (self.sp.type,
+            str += ' code type: %d, bpc: %d, bnc: %d, sys: %s, seed: %s\n' % (self.sp.type,
                                                            self.sp.bpc,
-                                                           self.sp.bnc)
+                                                           self.sp.bnc,
+                                                           self.sp.sys,
+                                                           self.sp.seed)
         str += '-->\n'
         return str
-
-    def fill_info(self):
-        """
-        (Re)fill detailed file information
-        """
-        statinfo = os.stat(self.filename)
-        self.filesize = statinfo.st_size
-        if self.filesize > DATASIZE:
-            self.numofseg = math.ceil(self.filesize/DATASIZE)
-            if self.segmentid == self.numofseg - 1:
-                # Last segment's size may < DATASIZE
-                currseg = self.filesize - DATASIZE * (self.numofseg - 1)
-            else:
-                currseg = DATASIZE
-            print("Segment ID: %d, segment size: %d" %
-                  (self.segmentid, currseg))
-            self.sp = snc_parameter(currseg, 0.01, 32, 64, 1280,
-                                    BAND_SNC, 0, 0)
-            self.segsize = currseg
-        else:
-            # Only one segment
-            self.numofseg = 1
-            self.sp = snc_parameter(self.filesize, 0.01, 32, 64, 1280,
-                                    BAND_SNC, 0, 0)
-            self.segsize = self.filesize
-
-
-class Session:
-    """ Session details
-    """
-    def __init__(self, meta):
-        self.meta = meta      # Metainfo of the session
-        self.sc = snc.snc_create_enc_context(None, meta.sp)
-        self.fdp = None       # fd of pipe of the parent side
-        self.fdc = None       # fd of pipe of the child side
-        self.datasock = None  # UDP socket for data transmission
-        self.clients = []     # List of clients in serving in the session
-        self.lastClean = datetime.now()
-        self.lastIdle = datetime.now()
-
-    def load_file(self):
-        """ Load file content into snc context of the session
-            This only happens in the session process (i.e., child).
-        """
-        offset = self.meta.segmentid * DATASIZE
-        filename = self.meta.filename.encode('UTF-8')
-        snc.snc_load_file_to_context(c_char_p(filename), offset, self.sc)
-
-    def add_client(self, cli):
-        """ Add a client to client list
-            cli - client
-        """
-        if self.clients.count(cli) is 0:
-            self.clients.append(cli)
-
-    def has_client(self, ip):
-        """ Check an ip is in client list
-        """
-        for cli in self.clients:
-            if cli.ip == ip:
-                return cli
-        return None
-
-    def remove_client(self, ip):
-        """ Remove the client of the given ip from client list
-        """
-        cli = self.has_client(ip)
-        if cli is not None:
-            self.clients.remove(cli)
 
 
 class HostInfo:

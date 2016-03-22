@@ -3,8 +3,8 @@ import socket
 import pickle
 from datetime import datetime
 from ccstructs import *
-#HOST = '127.0.0.1'
-HOST = '192.168.1.110'
+HOST = '127.0.0.1'
+#HOST = '192.168.1.110'
 PORT = 7653
 UDP_START = 7655
 HB_INTVAL = 10  # Heartbeat every 10 seconds
@@ -39,12 +39,13 @@ for segid in range(filemeta.numofseg):
         s.close()
         sys.exit(0)
     # Start receiving UDP data packets and decode the segment
-    decoder = snc.snc_create_decoder(ssmeta.sp, CBD_DECODER)
-    sncmeta_p = snc.snc_get_metainfo(snc.snc_get_enc_context(decoder))
+    decoder = snc.snc_create_decoder(byref(ssmeta.sp), GG_DECODER)
+    sncmeta_p = snc.snc_get_parameters(snc.snc_get_enc_context(decoder))
     udp_port = UDP_START + ssmeta.sessionid
     ds = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ds.settimeout(5.0)
     ds.bind(('', udp_port))
+    sncpkt_p = snc.snc_alloc_empty_packet(sncmeta_p)  # recv packet buffer
     while not snc.snc_decoder_finished(decoder):
         if (datetime.now() - lastBeat).seconds > HB_INTVAL:
             pkt = Packet(MSG['HEARTBEAT'], ssmeta)
@@ -65,7 +66,6 @@ for segid in range(filemeta.numofseg):
         except socket.timeout:
             continue
         # ccpkt = pickle.loads(data)
-        sncpkt_p = snc.snc_alloc_empty_packet(sncmeta_p)
         # ccpkt.payload.parse_dataload(sncpkt_p, ssmeta.sp)
         sncpkt_p.contents.deserialize(data, ssmeta.sp.size_g, ssmeta.sp.size_p)
         snc.snc_process_packet(decoder, sncpkt_p)
@@ -88,4 +88,5 @@ for segid in range(filemeta.numofseg):
             print("Connecting to server timeout")
             s.close()
     snc.snc_free_decoder(decoder)
+    snc.snc_free_packet(sncpkt_p)
 print("Finished")
