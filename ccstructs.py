@@ -2,7 +2,11 @@ import os
 import math
 from datetime import datetime
 from pysnc import *
-DATASIZE = 5120000  # Maximum datasize of each segment
+BUFSIZE = 4096       # TCP receive buffer size
+DATASIZE = 13107200  # Maximum datasize of each segment
+PORT = 7653
+UDP_START = 7655
+HB_INTVAL = 10  # Heartbeat every 10 seconds
 # Message types
 MSG =  {'OK'          : 0,
         'HEARTBEAT'   : 1,
@@ -17,6 +21,15 @@ MSG =  {'OK'          : 0,
         'FILEMETA'    : 21,
         'SESSIONMETA' : 22,
         'PEERINFO'    : 23,
+        # Client to client
+        'ASK_COOP'    : 31,    # Ask to send to me
+        'STOP_COOP'   : 32,    # Ask to stop sending to me
+        'EXIT_COOP'   : 33,    # Let the other side know that I'll stop sending
+        # Inter-process
+        'NEW_SESSION' : 41,    # New session info to cooperation process
+        'END_SESSION' : 42,    # Ending session info to cooperation process
+        'COOP_PKT'    : 43,    # SNC packet to cooperation process
+        'EXIT_PROC'   : 44,    # Exit cooperation process
         # Error message
         'ERR_NOFILE'  : 90,
         'ERR_MAXFILE' : 91,
@@ -47,15 +60,17 @@ class MetaInfo:
     """
     def __init__(self, filename, segmentid=-1, sessionid=-1):
         self.filename = filename
+        self.segmentid = segmentid
+        self.sessionid = sessionid
+        if not os.path.isfile(filename):
+            return
         statinfo = os.stat(self.filename)
         self.filesize = statinfo.st_size
         self.numofseg = int(math.ceil(float(self.filesize)/DATASIZE))
-        self.segmentid = segmentid
         if segmentid == self.numofseg - 1:
             self.segsize = self.filesize - DATASIZE * (self.numofseg - 1)
         else:
             self.segsize = DATASIZE
-        self.sessionid = sessionid
         self.sp = None
 
     def set_snc_params(self, sp):
@@ -89,10 +104,11 @@ class MetaInfo:
 
 
 class HostInfo:
-    def __init__(self, ip, lastBeat=None):
-        self.ip = ip
+    def __init__(self, ip, sessionid=-1, lastBeat=None):
+        self.ip = ip                       # ip address of the host
+        self.sessionid = sessionid         # sessionid the host belongs to
         if not lastBeat:
-            self.lastBeat = datetime.now()
+            self.lastBeat = datetime.now() # last heartbeat time
 
     def set_heartbeat(self, lastBeat):
         """ Set last heartbeat time of a remote host

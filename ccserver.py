@@ -6,12 +6,6 @@ import pickle
 import multiprocessing as mp
 from ccstructs import *
 HOST = ''
-PORT = 7653  # Ctrl port
-UDP_START = 7655
-HB_INTVAL = 10  # Heartbeat every 10 seconds
-
-BUFSIZE = 4096
-DATASIZE = 5120000
 
 CLIENT_EXPIRE = 60  # Client is expired if no heartbeat for long
 SESSION_EXPIRE = 60  # Session expires when idle for long time (in seconds)
@@ -34,7 +28,7 @@ class Session:
         self.fdp = None       # fd of pipe of the parent side
         self.fdc = None       # fd of pipe of the child side
         self.datasock = None  # UDP socket for data transmission
-        self.clients = []     # List of clients in serving in the session
+        self.clients = []     # List of clients (HostInfo objects) in serving in the session
         self.lastClean = datetime.now()
         self.lastIdle = datetime.now()
 
@@ -81,6 +75,14 @@ def send_file_meta(conn, filename):
         pkt = Packet(MSG['FILEMETA'], meta)
         conn.send(pickle.dumps(pkt))
 
+def send_peers_info(conn, session, ip):
+    """
+    For a given client IP of a session, select and send
+    a list of peers that he can connect
+    """
+    peers = [cli.ip for cli in session.clients if cli.ip != ip]
+    pkt = Packet(MSG['PEERINFO'], peers)
+    conn.send(pickle.dumps(pkt))
 
 def find_session(sessions, segmeta):
     """
@@ -93,7 +95,6 @@ def find_session(sessions, segmeta):
     else:
         return None
 
-
 def create_new_session(sessions, segmeta):
     """
     Create a new session with the given segment metainfo.
@@ -105,7 +106,7 @@ def create_new_session(sessions, segmeta):
         new_sid += 1
     # Create meta and fill in information of the file
     meta = MetaInfo(segmeta.filename, segmeta.segmentid, new_sid)
-    sp = snc_parameters(meta.segsize, 0.01, 32, 44, 1280, RAND_SNC, 0, 0, 0, -1)
+    sp = snc_parameters(meta.segsize, 0.01, 32, 128, 1280, BAND_SNC, 1, 0, 0, -1)
     meta.set_snc_params(sp)
     # Fork a child process and build pipe between parent and child
     session = Session(meta)
@@ -120,7 +121,6 @@ def create_new_session(sessions, segmeta):
     session.fdc.close()  # Close parent's fdc
     sessions[(segmeta.filename, segmeta.segmentid)] = (session, child)
     return session
-
 
 def call_session_process(session, msg):
     """
@@ -177,7 +177,7 @@ def handle_ctrl_packet(conn, pkt):
             if pkt.mtype == MSG['OK']:
                 # Add to client list of the session
                 print("Add ", ip, "into client list")
-                session.add_client(HostInfo(ip))
+                session.add_client(HostInfo(ip, session.meta.sessionid))
         else:
             print("Call_cession_process return -1")
     elif pkt.mtype == MSG['HEARTBEAT']:
@@ -204,7 +204,11 @@ def handle_ctrl_packet(conn, pkt):
             else:
                 # Child no reply, error notice to client
                 pass
-
+    elif pkt.mtype == MSG['CHK_PEERS']:
+        if session is None:
+            pass
+        else:
+            send_peers_info(conn, session, ip)
 
 def handle_ctrl_packet_child(session, pkt):
     """
@@ -237,7 +241,7 @@ def session_main(session):
                 print("Session [%d] receives msg of type <%d> from %s " %
                       (session.meta.sessionid, pkt.mtype, ip))
                 if pkt.mtype == MSG['REQ_SEG']:
-                    session.add_client(HostInfo(ip))
+                    session.add_client(HostInfo(ip, session.meta.sessionid))
                     session.fdc.send(Packet(MSG['OK']))
                 elif pkt.mtype == MSG['HEARTBEAT']:
                     session.fdc.send(Packet(MSG['OK']))
