@@ -14,6 +14,11 @@ OA_DECODER = 1
 BD_DECODER = 2
 CBD_DECODER = 3
 
+# scheduling algorithm of recoder
+TRIV_SCHED = 0
+RAND_SCHED = 1
+MLPI_SCHED = 2
+
 
 class snc_context(Structure):
     pass

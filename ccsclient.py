@@ -28,7 +28,7 @@ class Cooperation:
         recvpeers - peers sending packets belonging to current session to the decoder
                     ['ip1', 'ip2', ...]
         sncbuf    - buffer of segments for recoding
-                    {'segmentid': (sp, buf_p, pkt_p)}
+                    {'segmentid': [sp, buf_p, pkt_p, new, done]}
         peers     - connected peers sharing segments
                     {'segmentid': [hostinfo, ...]}
                     hostinfo contains peer's ip and its session id. The latter
@@ -50,49 +50,8 @@ class Cooperation:
               pkt - pointer to the packet sending buffer
         """
         pkt = snc.snc_alloc_empty_packet(byref(sp))
-        self.sncbuf[segmentid] = (sp, snc.snc_create_buffer(byref(sp), 10), pkt)
+        self.sncbuf[segmentid] = [sp, snc.snc_create_buffer(byref(sp), 128), pkt, 0, False]
         return
-
-    def stop_recv_curr_session(self, peerip):
-        """ Notify a peer to stop sending packets for current session
-        """
-        pkt = Packet(MSG['STOP_COOP'], self.currsess)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        try:
-            s.connect((peerip, PORT+1))
-            s.send(pickle.dumps(pkt))
-            self.recvpeers.remove(peerip)
-            print("Removed %s from sending list of segment %d."
-                    % (peerip, self.currsess.segmentid))
-            s.close()
-        except Exception as detail:
-            print("Cannot connect to peer", detail)
-            s.close()
-    
-    def stop_recv_curr_session_all(self):
-        """ Notify all peer to stop sending packets for current segment
-        """
-        for peerip in self.recvpeers:
-            self.stop_recv_curr_session(peerip)
-
-    def request_help_curr_session(self, peerip):
-        """ Request a peer to send packets for a segment specified in sessioninfo
-        """
-        if peerip and peerip not in self.recvpeers:
-            pkt = Packet(MSG['ASK_COOP'], self.currsess)
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.settimeout(5.0)
-            try:
-                s.connect((peerip, PORT+1))
-                s.send(pickle.dumps(pkt))
-                self.recvpeers.append(peerip)  # Add to list of recvpeers
-                print("Add %s to sending list of segment %d." 
-                        % (peerip, self.currsess.segmentid))
-                s.close()
-            except Exception as detail:
-                print("Cannot connect to peer", detail)
-                s.close()
 
     def check_curr_session_peers(self):
         """ Check out peer list of current session from server
@@ -109,38 +68,134 @@ class Cooperation:
             print("Available peers according to server: ", peers)
             s.close()
         except Exception as detail:
-            print("Cannot connect to peer", detail)
+            print("Cannot connect to peer", peerip, detail)
             peers = []
             s.close()
         return peers
 
+    def request_help_curr_session(self, peerip):
+        """ Request a peer to send packets for a segment specified in sessioninfo
+        """
+        if peerip and peerip not in self.recvpeers:
+            pkt = Packet(MSG['ASK_COOP'], self.currsess)
+            print("Request %s to send segment %d to me." 
+                    % (peerip, self.currsess.segmentid))
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(5.0)
+            try:
+                s.connect((peerip, PORT+1))
+                s.send(pickle.dumps(pkt))
+                if pickle.loads(s.recv(BUFSIZE)).mtype == MSG['OK']:
+                    print("Peer %s acknowledged my request of sending segment %d."
+                            % (peerip, self.currsess.segmentid))
+                    self.add_sending_peer(peerip)
+                    print("Done. Add %s to sending list of segment %d." 
+                            % (peerip, self.currsess.segmentid))
+                    print("Current sending list: ", self.recvpeers)
+                s.close()
+            except Exception as detail:
+                print("Cannot connect to peer", peerip, detail)
+                s.close()
+    
+    def stop_recv_curr_session(self, peerip):
+        """ Notify a peer to stop sending packets for current session
+        """
+        pkt = Packet(MSG['STOP_COOP'], self.currsess)
+        print("Request %s to stop sending segment %d to me."
+                % (peerip, self.currsess.segmentid))
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        try:
+            s.connect((peerip, PORT+1))
+            s.send(pickle.dumps(pkt))
+            if pickle.loads(s.recv(BUFSIZE)).mtype == MSG['OK']:
+                print("Peer %s acknowledged my request of stopping segment %d."
+                        % (peerip, self.currsess.segmentid))
+                self.recvpeers.remove(peerip)
+                print("Done. Remove %s from sending list of segment %d."
+                        % (peerip, self.currsess.segmentid))
+            s.close()
+        except Exception as detail:
+            print("Cannot connect to peer ", peerip, detail)
+            s.close()
+    
+    def stop_recv_curr_session_all(self):
+        """ Notify all peer to stop sending packets for current segment
+        """
+        for peerip in list(self.recvpeers):
+            # Note: make a copy of recvpeers to allow looping
+            self.stop_recv_curr_session(peerip)
+
+    def notify_exit_sending(self, peerip, segmentid):
+        """ Notify remote peer that I'll stop sending a segment
+        """
+        pkt = Packet(MSG['EXIT_COOP'], segmentid)
+        print("Notify %s about my exit of sending segment %d."
+                % (peerip, segmentid))
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(5.0)
+        try:
+            s.connect((peerip, PORT+1))
+            s.send(pickle.dumps(pkt))
+            if pickle.loads(s.recv(BUFSIZE)).mtype == MSG['OK']:
+                print("Peer %s acknowledged my exit of sending segment %d."
+                        % (peerip, segmentid))
+            s.close()
+        except Exception as detail:
+            print("Cannot connect to peer", peerip, detail)
+            s.close()
+        self.remove_receiving_peer(peerip, segmentid)
+        return
+
     def add_receiving_peer(self, peerip, segmentid, sessionid):
         """ Add peer to cooperation list of (receiving) a segment
         """
-        if not self.sncbuf[segmentid]:
+        if segmentid not in self.sncbuf:
             # segment not seen
-            pass
+            print("%s: requested segment %d by %s is not available"
+                   % (__name__, segmentid, peerip))
         if segmentid not in self.peers.keys():
             # first peer in list; initialize
             self.peers[segmentid] = []
-        peer = HostInfo(peerip, sessionid)
-        self.peers[segmentid].append(peer)
-        print("Add %s to receiving list of segment %d."
-                % (peerip, segmentid))
+        if peerip in [p.ip for p in self.peers[segmentid]]:
+            print("Warning: %s is already in receiving list of segment %d."
+                    % (peerip, segmentid))
+        else:
+            peer = HostInfo(peerip, sessionid)
+            self.peers[segmentid].append(peer)
+            print("Done. Add %s to receiving list of segment %d."
+                    % (peerip, segmentid))
         return
 
     def remove_receiving_peer(self, peerip, segmentid):
         """ Remove a peer from cooperation list of a segment. The peer
             won't receive packets from me anymore.
         """
-        if not self.peers[segmentid]:
+        if segmentid not in self.peers:
             # no peer list for the segment
-            pass
+            print("No peers in receiving list of segment %d"
+                    % (segmentid, ))
+            return
+        found = False
         for peer in self.peers[segmentid]:
             if peer.ip == peerip:
+                found = True
                 self.peers[segmentid].remove(peer)
-                print("Remove %s from receiving list of segment %s" 
+                print("Done. Remove %s from receiving list of segment %s" 
                         % (peerip, segmentid))
+        if not found:
+            print("Warning: %s is not found in receiving list of segment %d."
+                    % (peerip, segmentid))
+        return
+
+    def add_sending_peer(self, peerip):
+        """ Add a peer to the send list of current session
+            TO EXTEND: A host may receiving multiple sessions at a time.
+            In this case, there would be multiple sending lists being
+            maintained at a time.
+        """
+        if peerip and peerip not in self.recvpeers:
+            self.recvpeers.append(peerip)
         return
 
     def remove_sending_peer(self, peerip, segmentid):
@@ -149,26 +204,12 @@ class Cooperation:
         if self.currsess.segmentid == segmentid \
             and peerip in self.recvpeers:
             self.recvpeers.remove(peerip)
-            print("Remove %s from sending list of segment %s." 
+            print("Done. Remove %s from sending list of segment %s." 
+                    % (peerip, segmentid))
+        else:
+            print("Warning: %s is not in the receiving list of segment %d."
                     % (peerip, segmentid))
 
-    def notify_exit_sending(self, peerip, segmentid):
-        """ Notify remote peer that I'll stop sending a segment
-        """
-        pkt = Packet(MSG['EXIT_COOP'], segmentid)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(5.0)
-        try:
-            s.connect((peerip, PORT+1))
-            s.send(pickle.dumps(pkt))
-            print("Notify %s about my exit of sending segment %d."
-                    % (peerip, segmentid))
-            s.close()
-        except Exception as detail:
-            print("Cannot connect to peer", detail)
-            s.close()
-        self.remove_receiving_peer(peerip, segmentid)
-        return
 
 
 def cooperation_main(coop):
@@ -195,13 +236,13 @@ def cooperation_main(coop):
     poller.register(coop.fdc.fileno(), select.POLLIN)
     poller.register(coop.datasock.fileno(), select.POLLOUT)
     print("Start main loop of cooperation...")
-    new_buffered = 0
     while True:
         for fd, event in poller.poll():
             if fd == coop.pcl.fileno() and event is select.POLLIN:
-                """ peer control
+                """ peer to peer control
                      - ask for share
                      - stop share
+                     - exiting
                      - heartbeat
                 """
                 conn, addr = coop.pcl.accept()
@@ -209,16 +250,25 @@ def cooperation_main(coop):
                 print('Peer connection of type %d from %s' % (pkt.mtype, addr[0]))
                 if pkt.mtype == MSG['ASK_COOP']:
                     sinfo = pkt.payload
+                    print("Request from %s to send segment %d."
+                            % (addr[0], sinfo.segmentid))
                     coop.add_receiving_peer(addr[0], sinfo.segmentid, sinfo.sessionid)
+                    conn.send(pickle.dumps(Packet(MSG['OK'])))
                     # Send request if it is the same segment as we need
-                    if sinfo.segmentid == coop.currsess.segmentid:
+                    if coop.currsess and sinfo.segmentid == coop.currsess.segmentid:
                         coop.request_help_curr_session(addr[0])
                 if pkt.mtype == MSG['STOP_COOP']:
                     sinfo = pkt.payload
+                    print("Request from %s to stop sending segment %d."
+                            % (addr[0], sinfo.segmentid))
                     coop.remove_receiving_peer(addr[0], sinfo.segmentid)
+                    conn.send(pickle.dumps(Packet(MSG['OK'])))
                 if pkt.mtype == MSG['EXIT_COOP']:
                     segmentid = pkt.payload
+                    print("Notification from %s about exiting cooperation."
+                            % (addr[0], ))
                     coop.remove_sending_peer(addr[0], segmentid)
+                    conn.send(pickle.dumps(Packet(MSG['OK'])))
                 conn.close()
             if fd == coop.fdc.fileno() and event is select.POLLIN:
                 """ message from parent
@@ -242,11 +292,12 @@ def cooperation_main(coop):
                     print("End session %d (segment %d)" % (sinfo.sessionid, sinfo.segmentid))
                     if coop.currsess:
                         coop.stop_recv_curr_session_all()
+                    coop.sncbuf[coop.currsess.segmentid][4] = True
                     coop.currsess = None
                 if pkt.mtype == MSG['EXIT_PROC']:
                     print("Clean up cooperation process before exiting...")
                     for segid in coop.peers.keys():
-                        for peer in coop.peers[segid]:
+                        for peer in copy.deepcopy(coop.peers[segid]):
                             # I'm exiting. Please all receiving peers stop receiving from me
                             coop.notify_exit_sending(peer.ip, segid)
                         snc.snc_free_buffer(coop.sncbuf[segid][1])
@@ -259,12 +310,15 @@ def cooperation_main(coop):
                                                coop.currsess.sp.size_g,
                                                coop.currsess.sp.size_p)
                     snc.snc_buffer_packet(coop.sncbuf[coop.currsess.segmentid][1], pkt_p)
-                    new_buffered += 1
+                    coop.sncbuf[coop.currsess.segmentid][3] += 1
                     # print("Buffered a packet for segment %d (gid=%d)" % (coop.currsess.segmentid, pkt_p[0].gid))
-            if new_buffered > 100 and fd == coop.datasock.fileno() and event is select.POLLOUT:
+            if fd == coop.datasock.fileno() and event is select.POLLOUT:
                 """ send recoded packets
                 """
                 for sid in coop.peers.keys():
+                    if coop.sncbuf[sid][3] < 100 and not coop.sncbuf[sid][4]:
+                        # not sending cooperative packets if the buffer is not updated much
+                        continue
                     for peer in coop.peers[sid]:
                         # print("Send a recoded packet from segment %s to %s at port %s" 
                         #        % (sid, peer.ip, peer.sessionid+UDP_START))
@@ -277,10 +331,14 @@ def cooperation_main(coop):
                         except:
                             print("Caught exception sending to %s for segment %d."
                                     % (peer.ip, sid))
-                new_buffered = 0  # reset new buffered counter
+                    coop.sncbuf[sid][3] = 0 # reset new buffered counter
 
 
 filename = '/tmp/reffile.dat'
+# For test time
+storename = '/tmp/hello.tar.bz2'
+if os.path.isfile(storename):
+    os.remove(storename)
 # Check file meta info
 s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
 s.connect((HOST, PORT))
@@ -388,5 +446,13 @@ for segid in range(filemeta.numofseg):
     snc.snc_free_decoder(decoder)
     snc.snc_free_packet(sncpkt_p)
 print("Finished")
+s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+s.connect((HOST, PORT))
+pkt = Packet(MSG['EXIT'], sessioninfo)
+s.send(pickle.dumps(pkt))
+reply = pickle.loads(s.recv(BUFSIZE))
+if reply.mtype  == MSG['OK']:
+    print("Server has acknowledged my exit.")
+s.close()
 coop.fdp.send(Packet(MSG['EXIT_PROC']))
 child.join()

@@ -11,7 +11,7 @@ CLIENT_EXPIRE = 60  # Client is expired if no heartbeat for long
 SESSION_EXPIRE = 60  # Session expires when idle for long time (in seconds)
 
 """
-Server maintains a bunch of sessions, each of which corresponds to a child
+Server maintains a number of sessions, each of which corresponds to a child
 process serving some segment of a file. Sessions are maintained in a dict:
 {('filename', segmentid) : (Session, Process)}
 
@@ -29,6 +29,7 @@ class Session:
         self.fdc = None       # fd of pipe of the child side
         self.datasock = None  # UDP socket for data transmission
         self.clients = []     # List of clients (HostInfo objects) in serving in the session
+        self.cooplist = []   # List of clients available for cooperative transmission
         self.lastClean = datetime.now()
         self.lastIdle = datetime.now()
 
@@ -62,6 +63,22 @@ class Session:
         if cli is not None:
             self.clients.remove(cli)
 
+    def add_client_coop(self, cli):
+        """ Add a client to cooperation list
+        """
+        if self.cooplist.count(cli) is 0:
+            self.cooplist.append(cli)
+
+    def remove_client_coop(self, ip):
+        """ Remove a client from cooperation list
+        """
+        for cli in self.cooplist:
+            if cli.ip == ip:
+                self.cooplist.remove(cli)
+                print("Removed %s from cooplist of segment %d"
+                        % (ip, self.meta.segmentid))
+        return
+
 
 def send_file_meta(conn, filename):
     """
@@ -80,7 +97,7 @@ def send_peers_info(conn, session, ip):
     For a given client IP of a session, select and send
     a list of peers that he can connect
     """
-    peers = [cli.ip for cli in session.clients if cli.ip != ip]
+    peers = [cli.ip for cli in session.cooplist if cli.ip != ip]
     pkt = Packet(MSG['PEERINFO'], peers)
     conn.send(pickle.dumps(pkt))
 
@@ -164,10 +181,8 @@ def handle_ctrl_packet(conn, pkt):
     ip, port = conn.getpeername()
     if pkt.mtype == MSG['CHK_FILE']:
         send_file_meta(conn, pkt.payload.filename)
-    elif pkt.mtype == MSG['REQ_SEG']:
+    if pkt.mtype == MSG['REQ_SEG']:
         if session is None:
-            # Fix: cannot create too many sessions. Need to impose a limit
-            # ERR_MAXFILE will be send if maximum sessions reached
             session = create_new_session(sessions, pkt.payload)
         ret = call_session_process(session, (pkt, ip))
         if ret is 0:
@@ -178,9 +193,10 @@ def handle_ctrl_packet(conn, pkt):
                 # Add to client list of the session
                 print("Add ", ip, "into client list")
                 session.add_client(HostInfo(ip, session.meta.sessionid))
+                session.add_client_coop(HostInfo(ip, session.meta.sessionid))
         else:
             print("Call_cession_process return -1")
-    elif pkt.mtype == MSG['HEARTBEAT']:
+    if pkt.mtype == MSG['HEARTBEAT']:
         if session is None:
             # No such session, error notice
             pass
@@ -191,7 +207,8 @@ def handle_ctrl_packet(conn, pkt):
             else:
                 # Session no reply, error notice
                 pass
-    elif pkt.mtype == MSG['REQ_STOP']:
+            # FIXME: update heartbeat time in parent process as well
+    if pkt.mtype == MSG['REQ_STOP']:
         # remove client from session
         if session is None:
             # No such session, error notice to client
@@ -199,16 +216,28 @@ def handle_ctrl_packet(conn, pkt):
         else:
             ret = call_session_process(session, (pkt, ip))
             if ret is 0:
-                conn.send(pickle.dumps(Packet(MSG['OK'])))
                 session.remove_client(ip)
+                conn.send(pickle.dumps(Packet(MSG['OK'])))
             else:
                 # Child no reply, error notice to client
                 pass
-    elif pkt.mtype == MSG['CHK_PEERS']:
+    if pkt.mtype == MSG['CHK_PEERS']:
         if session is None:
             pass
         else:
             send_peers_info(conn, session, ip)
+    if pkt.mtype == MSG['EXIT']:
+        if session is None:
+            return
+        ret = call_session_process(session, (pkt, ip))
+        if ret is 0:
+            session.remove_client(ip)
+            # Remove the client from cooplist of all sessions
+            for v in sessions.values():
+                v[0].remove_client_coop(ip)
+            conn.send(pickle.dumps(Packet(MSG['OK'])))
+        else:
+            pass
 
 def handle_ctrl_packet_child(session, pkt):
     """
@@ -245,9 +274,10 @@ def session_main(session):
                     session.fdc.send(Packet(MSG['OK']))
                 elif pkt.mtype == MSG['HEARTBEAT']:
                     session.fdc.send(Packet(MSG['OK']))
-                elif pkt.mtype == MSG['REQ_STOP']:
+                elif pkt.mtype == MSG['REQ_STOP'] or pkt.mtype == MSG['EXIT']:
                     session.remove_client(ip)
                     session.fdc.send(Packet(MSG['OK']))
+                    
             if fd == session.datasock.fileno() and event is select.POLLOUT:
                 # writable datasock, send data packets to clients
                 for cli in session.clients:

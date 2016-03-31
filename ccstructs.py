@@ -3,7 +3,7 @@ import math
 from datetime import datetime
 from pysnc import *
 BUFSIZE = 4096       # TCP receive buffer size
-DATASIZE = 13107200  # Maximum datasize of each segment
+DATASIZE = 26214400  # Maximum datasize of each segment
 PORT = 7653
 UDP_START = 7655
 HB_INTVAL = 10  # Heartbeat every 10 seconds
@@ -17,6 +17,7 @@ MSG =  {'OK'          : 0,
         'REQ_STOP'    : 14,    # Request to stop segment trans.
         'CHK_PEERS'   : 15,    # Ask for peers' information
         'OFR_HELP'    : 16,    # Offer to help
+        'EXIT'        : 19,    # Leaving the transmission
         # Server to client
         'FILEMETA'    : 21,
         'SESSIONMETA' : 22,
@@ -77,29 +78,24 @@ class MetaInfo:
         self.sp = sp
 
     def __str__(self):
-        str = '<--\n'
-        str += ' File Name: %s\n' % (self.filename)
-        str += ' Segment ID: %d\n' % (self.segmentid)
-        str += ' Session ID: %d\n' % (self.sessionid)
+        str = '\n\t<--------------- Meta Info --------------->\n'
+        str += '\t  File Name: %s\n' % (self.filename)
+        str += '\t  Segment ID: %d\n' % (self.segmentid)
+        str += '\t  Session ID: %d\n' % (self.sessionid)
         if self.filesize is not None:
-            str += ' File Size: %d\n' % (self.filesize)
+            str += '\t  File Size: %d\n' % (self.filesize)
         if self.segsize is not None:
-            str += ' Segment Size: %d\n' % (self.segsize)
+            str += '\t  Segment Size: %d\n' % (self.segsize)
         if self.numofseg is not None:
-            str += ' Number of Segments: %d\n' % (self.numofseg)
+            str += '\t  Number of Segments: %d\n' % (self.numofseg)
         if self.sp is not None:
-            str += ' [------------ SNC Parameter ------------]\n'
-            str += ' Datasize: %d, pcrate: %.3f\n' % (self.sp.datasize,
+            str += '\t [------------ SNC Parameter ------------]\n'
+            str += '\t  Datasize: %d, pcrate: %.3f\n' % (self.sp.datasize,
                                                       self.sp.pcrate)
-            str += ' size_b: %d, size_g: %d, size_p: %d\n' % (self.sp.size_b,
+            str += '\t  size_b: %d, size_g: %d, size_p: %d\n' % (self.sp.size_b,
                                                               self.sp.size_g,
                                                               self.sp.size_p)
-            str += ' code type: %d, bpc: %d, bnc: %d, sys: %s, seed: %s\n' % (self.sp.type,
-                                                           self.sp.bpc,
-                                                           self.sp.bnc,
-                                                           self.sp.sys,
-                                                           self.sp.seed)
-        str += '-->\n'
+            str += '\t  code type: %d, bpc: %d, bnc: %d, sys: %s\n\t  seed: %s\n' % (self.sp.type, self.sp.bpc, self.sp.bnc, self.sp.sys, self.sp.seed)
         return str
 
 
