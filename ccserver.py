@@ -3,11 +3,16 @@ import sys
 import socket
 import select
 import pickle
+import logging
+import copy
 import multiprocessing as mp
 from ccstructs import *
+
+logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(levelname)s: [%(asctime)s] %(message)s')
+
 HOST = ''
 
-CLIENT_EXPIRE = 60  # Client is expired if no heartbeat for long
+CLIENT_EXPIRE = 30  # Client is expired if no heartbeat for long
 SESSION_EXPIRE = 60  # Session expires when idle for long time (in seconds)
 
 """
@@ -32,6 +37,54 @@ class Session:
         self.cooplist = []   # List of clients available for cooperative transmission
         self.lastClean = datetime.now()
         self.lastIdle = datetime.now()
+
+    def main(self):
+        """
+        Main loop of the child process of each session.
+        This routine never exit
+        """
+        self.pid = os.getpid()
+        self.fdp.close()  # Close fdp on child side
+        if self.datasock is None:
+            # Create session's data socket and load file
+            self.datasock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            self.load_file()
+            logging.info("Child process finish loading file")
+        port = UDP_START + self.meta.sessionid  # Port used by the session
+        poller = select.poll()  # poll fdc and datasock
+        poller.register(self.fdc.fileno(), select.POLLIN)
+        poller.register(self.datasock.fileno(), select.POLLOUT)
+        pkt_p = snc.snc_alloc_empty_packet(snc.snc_get_parameters(self.sc))
+        while True:
+            for fd, event in poller.poll():
+                if fd == self.fdc.fileno() and event is select.POLLIN:
+                    pkt, ip = self.fdc.recv()
+                    logging.info("Session [%d] receives msg <%s> from %s " %
+                                    (self.meta.sessionid, iMSG[pkt.mtype], ip))
+                    if pkt.mtype == MSG['REQ_SEG']:
+                        self.add_client(HostInfo(ip, self.meta.sessionid))
+                        self.fdc.send(Packet(MSG['OK']))
+                    elif pkt.mtype == MSG['HEARTBEAT']:
+                        self.client_heartbeat(ip)
+                        self.fdc.send(Packet(MSG['OK']))
+                    elif pkt.mtype == MSG['REQ_STOP'] or pkt.mtype == MSG['EXIT']:
+                        self.remove_client(ip)
+                        self.fdc.send(Packet(MSG['OK']))
+                        
+                if fd == self.datasock.fileno() and event is select.POLLOUT:
+                    # writable datasock, send data packets to clients
+                    for cli in self.clients:
+                        snc.snc_generate_packet_im(self.sc, pkt_p)
+                        pktstr = pkt_p.contents.serialize(self.meta.sp.size_g,
+                                                          self.meta.sp.size_p,
+                                                          self.meta.sp.bnc)
+                        try:
+                            self.datasock.sendto(pktstr, (cli.ip, port))
+                        except:
+                            logging.warning("Caught exception in session %s." 
+                                                % (self.meta.sessionid,))
+                        self.lastIdle = datetime.now()  # Refresh idle time
+            self.housekeeping()
 
     def load_file(self):
         """ Load file content into snc context of the session
@@ -75,9 +128,40 @@ class Session:
         for cli in self.cooplist:
             if cli.ip == ip:
                 self.cooplist.remove(cli)
-                print("Removed %s from cooplist of segment %d"
-                        % (ip, self.meta.segmentid))
+                logging.info("Removed %s from cooplist of segment %d"
+                                % (ip, self.meta.segmentid))
         return
+
+    def client_heartbeat(self, ip):
+        """ Update heartbeat of clients
+        """
+        for cli in self.clients:
+            if cli.ip == ip:
+                cli.set_heartbeat()
+        for cli in self.cooplist:
+            if cli.ip == ip:
+                cli.set_heartbeat()
+
+    def housekeeping(self):
+        """ Housekeeping of a session
+            - Remove clients that didn't heartbeat for long
+            - Exit if the session has been idle (i.e., no clients) for long
+
+            Fixme:
+              May not be efficient because now() will be called too often.
+        """
+        now = datetime.now()
+        if (now - self.lastClean).seconds > CLIENT_EXPIRE:
+            # Clean up no heartbeat clients
+            for cli in copy.deepcopy(self.clients):
+                if (now - cli.lastBeat).seconds > CLIENT_EXPIRE:
+                    logging.info("Remove client %s because no heartbeat"
+                                    % (cli.ip,))
+                    self.remove_client(cli.ip)
+            self.lastClean = now
+        if (now - self.lastIdle).seconds > SESSION_EXPIRE:
+            self.datasock.close()
+            sys.exit(0)
 
 
 def send_file_meta(conn, filename):
@@ -123,17 +207,17 @@ def create_new_session(sessions, segmeta):
         new_sid += 1
     # Create meta and fill in information of the file
     meta = MetaInfo(segmeta.filename, segmeta.segmentid, new_sid)
-    sp = snc_parameters(meta.segsize, 0.01, 32, 128, 1280, BAND_SNC, 1, 0, 0, -1)
+    sp = snc_parameters(meta.segsize, 0.01, 16, 64, 1280, BAND_SNC, 1, 1, 0, -1)
     meta.set_snc_params(sp)
     # Fork a child process and build pipe between parent and child
     session = Session(meta)
     (fdp, fdc) = mp.Pipe()
     session.fdp = fdp
     session.fdc = fdc
-    print("New session created, ID: ", new_sid)
+    logging.info("New session created, ID: %d " % (new_sid,))
     print(session.meta)
     # Fork a process to serve the clients of the session
-    child = mp.Process(target=session_main, args=(session, ))
+    child = mp.Process(target=session.main)
     child.start()
     session.fdc.close()  # Close parent's fdc
     sessions[(segmeta.filename, segmeta.segmentid)] = (session, child)
@@ -163,8 +247,8 @@ def housekeeping():
     exited = []
     for k in sessions.keys():
         if not sessions[k][1].is_alive():
-            print("Session [", sessions[k][0].meta.sessionid,
-                  "] of ", k, " is expired.")
+            logging.info("Session [%d] of %s (segment %d) is expired."
+                            % (sessions[k][0].meta.sessionid, k[0], k[1]))
             sessions[k][1].join()
             exited.append(k)
     for k in exited:
@@ -188,14 +272,19 @@ def handle_ctrl_packet(conn, pkt):
         if ret is 0:
             pkt = Packet(MSG['SESSIONMETA'], session.meta)
             conn.send(pickle.dumps(pkt))  # Send session's data
-            pkt = pickle.loads(conn.recv(BUFSIZE))  # Get client's reply
-            if pkt.mtype == MSG['OK']:
-                # Add to client list of the session
-                print("Add ", ip, "into client list")
-                session.add_client(HostInfo(ip, session.meta.sessionid))
-                session.add_client_coop(HostInfo(ip, session.meta.sessionid))
+            try:
+                pkt = pickle.loads(conn.recv(BUFSIZE))  # Get client's reply
+                if pkt.mtype == MSG['OK']:
+                    # Add to client list of the session
+                    logging.info("Add %s into client list of segment %d" 
+                                    % (ip, session.meta.segmentid))
+                    session.add_client(HostInfo(ip, session.meta.sessionid))
+                    session.add_client_coop(HostInfo(ip, session.meta.sessionid))
+            except Exception as detail:
+                logging.warning("Caught exception receiving from %s for segment %d."
+                        % (ip, session.meta.segmentid))
         else:
-            print("Call_cession_process return -1")
+            logging.info("Call_cession_process return -1")
     if pkt.mtype == MSG['HEARTBEAT']:
         if session is None:
             # No such session, error notice
@@ -207,7 +296,7 @@ def handle_ctrl_packet(conn, pkt):
             else:
                 # Session no reply, error notice
                 pass
-            # FIXME: update heartbeat time in parent process as well
+            session.client_heartbeat(addr[0])
     if pkt.mtype == MSG['REQ_STOP']:
         # remove client from session
         if session is None:
@@ -239,80 +328,6 @@ def handle_ctrl_packet(conn, pkt):
         else:
             pass
 
-def handle_ctrl_packet_child(session, pkt):
-    """
-    Child process handle control packet passed from parent process
-    """
-    pass
-
-
-def session_main(session):
-    """
-    Main loop of the child process of each session.
-    This routine never exit
-    """
-    session.pid = os.getpid()
-    session.fdp.close()  # Close fdp on child side
-    if session.datasock is None:
-        # Create session's data socket and load file
-        session.datasock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        session.load_file()
-        print("Child process finish loading file")
-    port = UDP_START + session.meta.sessionid  # Port used by the session
-    poller = select.poll()  # poll fdc and datasock
-    poller.register(session.fdc.fileno(), select.POLLIN)
-    poller.register(session.datasock.fileno(), select.POLLOUT)
-    pkt_p = snc.snc_alloc_empty_packet(snc.snc_get_parameters(session.sc))
-    while True:
-        for fd, event in poller.poll():
-            if fd == session.fdc.fileno() and event is select.POLLIN:
-                pkt, ip = session.fdc.recv()
-                print("Session [%d] receives msg of type <%d> from %s " %
-                      (session.meta.sessionid, pkt.mtype, ip))
-                if pkt.mtype == MSG['REQ_SEG']:
-                    session.add_client(HostInfo(ip, session.meta.sessionid))
-                    session.fdc.send(Packet(MSG['OK']))
-                elif pkt.mtype == MSG['HEARTBEAT']:
-                    session.fdc.send(Packet(MSG['OK']))
-                elif pkt.mtype == MSG['REQ_STOP'] or pkt.mtype == MSG['EXIT']:
-                    session.remove_client(ip)
-                    session.fdc.send(Packet(MSG['OK']))
-                    
-            if fd == session.datasock.fileno() and event is select.POLLOUT:
-                # writable datasock, send data packets to clients
-                for cli in session.clients:
-                    snc.snc_generate_packet_im(session.sc, pkt_p)
-                    pktstr = pkt_p.contents.serialize(session.meta.sp.size_g,
-                                                      session.meta.sp.size_p)
-                    try:
-                        session.datasock.sendto(pktstr, (cli.ip, port))
-                    except:
-                        print("Caught exception in session ID: ",
-                              session.meta.sessionid)
-                    session.lastIdle = datetime.now()  # Refresh idle time
-        session_housekeeping(session)
-
-
-def session_housekeeping(session):
-    """ Housekeeping of a session
-        - Remove clients that didn't heartbeat for long
-        - Exit if the session has been idle (i.e., no clients) for long
-
-        Fixme:
-          May not be efficient because now() will be called too often.
-    """
-    now = datetime.now()
-    if (now - session.lastClean).seconds > CLIENT_EXPIRE:
-        # Clean up no heartbeat clients
-        for cli in session.clients:
-            if (now - cli.lastBeat).seconds > CLIENT_EXPIRE:
-                print("Remove client ", cli.ip, "because no heartbeat")
-                session.remove_client(cli.ip)
-        session.lastClean = now
-    if (now - session.lastIdle).seconds > SESSION_EXPIRE:
-        session.datasock.close()
-        sys.exit(0)
-
 
 if __name__ == "__main__":
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -326,8 +341,8 @@ if __name__ == "__main__":
             # handle control connections
             ip = addr[0]
             # print('Connection from: ', ip)
-            bindata = conn.recv(BUFSIZE)
-            ccpkt = pickle.loads(bindata)
+            data = conn.recv(BUFSIZE)
+            ccpkt = pickle.loads(data)
             handle_ctrl_packet(conn, ccpkt)
             conn.close()
         except socket.timeout:

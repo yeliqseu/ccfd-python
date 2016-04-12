@@ -29,7 +29,7 @@ class snc_packet(Structure):
                 ("coes", POINTER(c_ubyte)),
                 ("syms", POINTER(c_ubyte))]
 
-    def serialize(self, size_g, size_p, bnc=0):
+    def serialize(self, size_g, size_p, bnc):
         """ Serialize an SNC packet to a binary byte string
         """
         pktstr = bytearray()
@@ -42,7 +42,7 @@ class snc_packet(Structure):
         pktstr += cast(self.syms, POINTER(c_ubyte * size_p))[0]
         return pktstr
 
-    def deserialize(self, pktstr, size_g, size_p, bnc=0):
+    def deserialize(self, pktstr, size_g, size_p, bnc):
         """ Deserialize a byte stream and fill in an existing snc_packet
         instance
         """
@@ -116,7 +116,7 @@ snc.snc_generate_packet_im.restype = c_int
 snc.snc_free_packet.argtypes = [POINTER(snc_packet)]
 snc.snc_free_packet.restype = None
 
-snc.print_code_summary.argtypes = [POINTER(snc_context), c_int, c_longlong]
+snc.print_code_summary.argtypes = [POINTER(snc_context), c_double, c_double]
 snc.print_code_summary.restype = None
 
 ##########################
@@ -134,11 +134,11 @@ snc.snc_process_packet.restype = None
 snc.snc_decoder_finished.argtypes = [POINTER(snc_decoder)]
 snc.snc_decoder_finished.restype = c_int
 
-snc.snc_code_overhead.argtypes = [POINTER(snc_decoder)]
-snc.snc_code_overhead.restype = c_int
+snc.snc_decode_overhead.argtypes = [POINTER(snc_decoder)]
+snc.snc_decode_overhead.restype = c_double
 
 snc.snc_decode_cost.argtypes = [POINTER(snc_decoder)]
-snc.snc_decode_cost.restype = c_longlong
+snc.snc_decode_cost.restype = c_double
 
 snc.snc_free_decoder.argtypes = [POINTER(snc_decoder)]
 snc.snc_free_decoder.restype = None

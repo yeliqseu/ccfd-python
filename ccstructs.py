@@ -6,39 +6,43 @@ BUFSIZE = 4096       # TCP receive buffer size
 DATASIZE = 26214400  # Maximum datasize of each segment
 PORT = 7653
 UDP_START = 7655
-HB_INTVAL = 10  # Heartbeat every 10 seconds
+HB_INTVAL = 1  # Heartbeat every HB_INTVAL seconds
 # Message types
-MSG =  {'OK'          : 0,
-        'HEARTBEAT'   : 1,
+MSG =  {'OK'                : 0,
+        'HEARTBEAT'         : 1,
         # Client to server
-        'CHK_FILE'    : 11,    # Check file meta
-        'REQ_SEG'     : 12,    # Request segment
-        'REQ_START'   : 13,    # Request to start segment transmission
-        'REQ_STOP'    : 14,    # Request to stop segment trans.
-        'CHK_PEERS'   : 15,    # Ask for peers' information
-        'OFR_HELP'    : 16,    # Offer to help
-        'EXIT'        : 19,    # Leaving the transmission
+        'CHK_FILE'          : 11,    # Check file meta
+        'REQ_SEG'           : 12,    # Request segment
+        'REQ_START'         : 13,    # Request to start segment transmission
+        'REQ_STOP'          : 14,    # Request to stop segment trans.
+        'CHK_PEERS'         : 15,    # Ask for peers' information
+        'OFR_HELP'          : 16,    # Offer to help
+        'EXIT'              : 19,    # Leaving the transmission
         # Server to client
-        'FILEMETA'    : 21,
-        'SESSIONMETA' : 22,
-        'PEERINFO'    : 23,
+        'FILEMETA'          : 21,
+        'SESSIONMETA'       : 22,
+        'PEERINFO'          : 23,
         # Client to client
-        'ASK_COOP'    : 31,    # Ask to send to me
-        'STOP_COOP'   : 32,    # Ask to stop sending to me
-        'EXIT_COOP'   : 33,    # Let the other side know that I'll stop sending
+        'ASK_COOP'          : 31,    # Ask to send to me
+        'STOP_COOP'         : 32,    # Ask to stop sending to me
+        'EXIT_COOP'         : 33,    # Let the other side know that I'll stop sending
         # Inter-process
-        'NEW_SESSION' : 41,    # New session info to cooperation process
-        'END_SESSION' : 42,    # Ending session info to cooperation process
-        'COOP_PKT'    : 43,    # SNC packet to cooperation process
-        'EXIT_PROC'   : 44,    # Exit cooperation process
+        'NEW_SESSION'       : 41,    # New session info to cooperation process
+        'END_SESSION'       : 42,    # Ending session info to cooperation process
+        'COOP_PKT'          : 43,    # SNC packet to cooperation process
+        'EXIT_PROC'         : 44,    # Exit cooperation process
         # Error message
-        'ERR_NOFILE'  : 90,
-        'ERR_MAXFILE' : 91,
-        'ERR_MAXCONN' : 92,
-        'ERR_NOBEAT'  : 93,
+        'ERR_NOFILE'        : 90,
+        'ERR_MAXFILE'       : 91,
+        'ERR_MAXCONN'       : 92,
+        'ERR_NOBEAT'        : 93,
+        'ERR_PNOSEG'        : 94,   # Peer error: requested segment not available
+        'ERR_DUPRECV'       : 95,   # Peer is already in receiving list
+        'ERR_PNOTFOUND'     : 96,   # Peer not in record
         # Data
-        'DATA'        : 99}
+        'DATA'              : 99}
 
+iMSG = {v: k for k, v in MSG.items()}
 
 class MetaInfo:
     """ Metainfo of a file and session
@@ -106,10 +110,12 @@ class HostInfo:
         if not lastBeat:
             self.lastBeat = datetime.now() # last heartbeat time
 
-    def set_heartbeat(self, lastBeat):
+    def set_heartbeat(self, lastBeat=None):
         """ Set last heartbeat time of a remote host
         """
         self.lastBeat = lastBeat
+        if not lastBeat:
+            self.lastBeat = datetime.now()
 
 
 class Packet:
