@@ -17,7 +17,7 @@ SESSION_EXPIRE = 60  # Session expires when idle for long time (in seconds)
 
 """
 Server maintains a number of sessions, each of which corresponds to a child
-process serving some segment of a file. Sessions are maintained in a dict:
+process serving one segment of a file. Sessions are maintained in a dict:
 {('filename', segmentid) : (Session, Process)}
 
 """
@@ -153,6 +153,7 @@ class Session:
         now = datetime.now()
         if (now - self.lastClean).seconds > CLIENT_EXPIRE:
             # Clean up no heartbeat clients
+            logging.info("Session [%d] do housekeeping..." % (self.meta.sessionid))
             for cli in copy.deepcopy(self.clients):
                 if (now - cli.lastBeat).seconds > CLIENT_EXPIRE:
                     logging.info("Remove client %s because no heartbeat"
@@ -160,6 +161,7 @@ class Session:
                     self.remove_client(cli.ip)
             self.lastClean = now
         if (now - self.lastIdle).seconds > SESSION_EXPIRE:
+            logging.info("Session [%d] exiting..." % (self.meta.sessionid))
             self.datasock.close()
             sys.exit(0)
 
@@ -244,6 +246,8 @@ def housekeeping():
     """ Housekeeping tasks of the parent process
         - Clean exited session from sessions list
     """
+    # logging.info("Main process doing housekeeping...")
+    # print(sessions)
     exited = []
     for k in sessions.keys():
         if not sessions[k][1].is_alive():
@@ -257,12 +261,13 @@ def housekeeping():
 
 def handle_ctrl_packet(conn, pkt):
     """
-    Server main
+    Server's main routine for processing client messages
     """
     global sessions
-    # print("Message type: ", pkt.header.op)
-    session = find_session(sessions, pkt.payload)
     ip, port = conn.getpeername()
+    logging.info("Server receives msg <%s> from %s " %
+                    (iMSG[pkt.mtype], ip))
+    session = find_session(sessions, pkt.payload)
     if pkt.mtype == MSG['CHK_FILE']:
         send_file_meta(conn, pkt.payload.filename)
     if pkt.mtype == MSG['REQ_SEG']:
@@ -271,18 +276,16 @@ def handle_ctrl_packet(conn, pkt):
         ret = call_session_process(session, (pkt, ip))
         if ret is 0:
             pkt = Packet(MSG['SESSIONMETA'], session.meta)
-            conn.send(pickle.dumps(pkt))  # Send session's data
             try:
-                pkt = pickle.loads(conn.recv(BUFSIZE))  # Get client's reply
-                if pkt.mtype == MSG['OK']:
-                    # Add to client list of the session
-                    logging.info("Add %s into client list of segment %d" 
-                                    % (ip, session.meta.segmentid))
-                    session.add_client(HostInfo(ip, session.meta.sessionid))
-                    session.add_client_coop(HostInfo(ip, session.meta.sessionid))
+                conn.send(pickle.dumps(pkt))  # Send session's data
+                # Add to client list of the session
+                logging.info("Add %s into client list of segment %d" 
+                                % (ip, session.meta.segmentid))
+                session.add_client(HostInfo(ip, session.meta.sessionid))
+                session.add_client_coop(HostInfo(ip, session.meta.sessionid))
             except Exception as detail:
-                logging.warning("Caught exception receiving from %s for segment %d."
-                        % (ip, session.meta.segmentid))
+                logging.warning("Caught exception receiving from %s for segment %d: %s."
+                                    % (ip, session.meta.segmentid, detail))
         else:
             logging.info("Call_cession_process return -1")
     if pkt.mtype == MSG['HEARTBEAT']:
@@ -306,7 +309,7 @@ def handle_ctrl_packet(conn, pkt):
             ret = call_session_process(session, (pkt, ip))
             if ret is 0:
                 session.remove_client(ip)
-                conn.send(pickle.dumps(Packet(MSG['OK'])))
+                conn.send(pickle.dumps(Packet(MSG['OK'], session.meta)))
             else:
                 # Child no reply, error notice to client
                 pass
@@ -315,6 +318,7 @@ def handle_ctrl_packet(conn, pkt):
             pass
         else:
             send_peers_info(conn, session, ip)
+        conn.close()
     if pkt.mtype == MSG['EXIT']:
         if session is None:
             return
@@ -327,6 +331,7 @@ def handle_ctrl_packet(conn, pkt):
             conn.send(pickle.dumps(Packet(MSG['OK'])))
         else:
             pass
+        conn.close()
 
 
 if __name__ == "__main__":
@@ -334,16 +339,32 @@ if __name__ == "__main__":
     s.settimeout(5.0)
     s.bind((HOST, PORT))
     s.listen(1)
+    poller = select.poll()  # poll listen socket and client connections
+    poller.register(s.fileno(), select.POLLIN)
+    sockets = {s.fileno() : s}
     while True:
         housekeeping()
-        try:
-            conn, addr = s.accept()
-            # handle control connections
-            ip = addr[0]
-            # print('Connection from: ', ip)
-            data = conn.recv(BUFSIZE)
-            ccpkt = pickle.loads(data)
-            handle_ctrl_packet(conn, ccpkt)
-            conn.close()
-        except socket.timeout:
-            continue
+        for fd, event in poller.poll(1):
+            # print("fd %d triggered event %s" % (fd, event))
+            if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
+                print("Unregister broken fd: %d" % (fd, ))
+                poller.unregister(fd)
+                del sockets[fd]
+            elif fd == s.fileno() and event is select.POLLIN:
+                newconn, addr = s.accept()
+                # newconn.setblocking(False)
+                sockets[newconn.fileno()] = newconn  # save the socket
+                poller.register(newconn.fileno(), select.POLLIN)
+                logging.info('Accepted connection from: %s on fd %d ' 
+                                % (addr[0], newconn.fileno()))
+            elif event is select.POLLIN:
+                conn = sockets[fd]  # get socket of the file descriptor
+                try:
+                    data = conn.recv(BUFSIZE)
+                    ccpkt = pickle.loads(data)
+                    handle_ctrl_packet(conn, ccpkt)
+                except Exception as detail:
+                    logging.warning("Cannot receive from fd %d" % (fd, ))
+                    poller.unregister(fd)
+                    del sockets[fd]
+                    continue
