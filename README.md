@@ -1,0 +1,20 @@
+# Coded Cooperative File Distribution #
+This prototype project (ccfd stands for **c**oded **c**ooperative **f**ile **d**istribution) is to experiment file distribution using sparse random linear network codes. It distributes files from a server host to mutliple clients over a network where clients may cooperate with each other. Intuitively, it may sound quite similar to peer-to-peer file distribution programs such as BitTorrent. However, ccfd is novel in that packets are transmitted via UDP; a coding framework is introduced to 1) ensure reliable delivery of files and 2) allow improved transmission speed through *network coding*. These features make ccfd totally different from almost all the other file distribution software. The design around coded UDP makes ccfd a very fast and simple file transmission protocol.
+## System Design ##
+A file being distributed is splitted into (near) equal-size *segments* and each segment is distributed in a *session*. The server maintains the transmission of multiple sessions of multiple files. A client downloading a file is only in one session at a time.
+
+Each client downloading a segment of a file is connected to the server and some other peers who are downloading the same file. The client maintains TCP connections to other nodes for exchanging control messages. The data packets of the file are coded using sparse network codes (SNC, https://github.com/yeliqseu/sparsenc). Data packets are transmitted between the nodes using UDP thanks to the built-in erasure-correction capability of SNC. Each node has a fixed port receiving UDP data packets. The port number is determined by the ID of the current session (sessionid), which is allocated by the server at the beginning of the transmission of the segment. In control messages, each client node identifies to others using the filename and the ID of the segment (segmentid) in downloading, as well as the sessionid. The filename and segmentid specifiy how to encode a packet and the sessionid indicates the UDP port number.
+
+The server maintains multiple processes. A main process manages client connections and handles client requests such as start, terminate transmission, check for available peers etc. The rest of the processes are workers, one per session, which is responsible for sending data packets of one segment to requesting clients via UDP. The main process cotrols and communicates with the workers via pipes. The worker processes do not interact with clients directly and are merely for sending the connectionless UDP packets.
+
+Each client node has two processes: the main and cooperation processes. The main process initiates downloading and receives/decodes data packets from the designated UDP port. The main process requests segments of the file one by one and stops when all the segments of the file are recovered. The cooperation process manages a peer-to-peer network. It obtains a list of nodes from the server that may help the current receiving segment. The process then requests cooperation from the peers by asking them to send data packets to the UDP port. At the same time, the cooperation process also sends (recoded) data packets of received/receiving segments to other peers. The data packets are forwarded from the main process to the cooperation process via pipe. Peers communicate control messages with each other only via the cooperation process. The (recoded) data packets, however, are sent to the main processes of the peers via UDP.
+
+The cooperation process is the key component of the design and needs to
+
+    1. Maintain TCP connections between peers;
+    2. Maintain a list of peers who are sending data packets to the main process;
+    3. Maintain SNC buffers of segments that the node have been received/receiving;
+    4. Maintain lists of receiving peers of the buffers and send packets to the peers;
+    5. Interact with the main process (store packets into the buffers and heartbeat).
+
+There are **two** TCP connections between each pair of peers, for sending and receiving control messages, respectively.
