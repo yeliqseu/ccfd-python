@@ -49,7 +49,7 @@ class Session:
             # Create session's data socket and load file
             self.datasock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             self.load_file()
-            logging.info("Child process finish loading file")
+            logging.info("Child process finished loading file")
         port = UDP_START + self.meta.sessionid  # Port used by the session
         poller = select.poll()  # poll fdc and datasock
         poller.register(self.fdc.fileno(), select.POLLIN)
@@ -59,8 +59,8 @@ class Session:
             for fd, event in poller.poll():
                 if fd == self.fdc.fileno() and event is select.POLLIN:
                     pkt, ip = self.fdc.recv()
-                    logging.info("Session [%d] receives msg <%s> from %s " %
-                                    (self.meta.sessionid, iMSG[pkt.mtype], ip))
+                    logging.info("Session [%d] received msg <%s> from %s. Stamp: %s " %
+                                    (self.meta.sessionid, iMSG[pkt.mtype], ip, pkt.stamp))
                     if pkt.mtype == MSG['REQ_SEG']:
                         self.add_client(HostInfo(ip, self.meta.sessionid))
                         self.fdc.send(Packet(MSG['OK']))
@@ -70,7 +70,7 @@ class Session:
                     elif pkt.mtype == MSG['REQ_STOP'] or pkt.mtype == MSG['EXIT']:
                         self.remove_client(ip)
                         self.fdc.send(Packet(MSG['OK']))
-                        
+
                 if fd == self.datasock.fileno() and event is select.POLLOUT:
                     # writable datasock, send data packets to clients
                     for cli in self.clients:
@@ -81,7 +81,7 @@ class Session:
                         try:
                             self.datasock.sendto(pktstr, (cli.ip, port))
                         except:
-                            logging.warning("Caught exception in session %s." 
+                            logging.warning("Caught exception in session %s."
                                                 % (self.meta.sessionid,))
                         self.lastIdle = datetime.now()  # Refresh idle time
             self.housekeeping()
@@ -156,7 +156,7 @@ class Session:
             logging.info("Session [%d] do housekeeping..." % (self.meta.sessionid))
             for cli in copy.deepcopy(self.clients):
                 if (now - cli.lastBeat).seconds > CLIENT_EXPIRE:
-                    logging.info("Remove client %s because no heartbeat"
+                    logging.warning("Remove client %s because no heartbeat"
                                     % (cli.ip,))
                     self.remove_client(cli.ip)
             self.lastClean = now
@@ -279,7 +279,7 @@ def handle_ctrl_packet(conn, pkt):
             try:
                 conn.send(pickle.dumps(pkt))  # Send session's data
                 # Add to client list of the session
-                logging.info("Add %s into client list of segment %d" 
+                logging.info("Add %s into client list of segment %d"
                                 % (ip, session.meta.segmentid))
                 session.add_client(HostInfo(ip, session.meta.sessionid))
                 session.add_client_coop(HostInfo(ip, session.meta.sessionid))
@@ -347,7 +347,7 @@ if __name__ == "__main__":
         for fd, event in poller.poll(1):
             # print("fd %d triggered event %s" % (fd, event))
             if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
-                print("Unregister broken fd: %d" % (fd, ))
+                logging.warning("Unregister broken fd: %d" % (fd, ))
                 poller.unregister(fd)
                 del sockets[fd]
             elif fd == s.fileno() and event is select.POLLIN:
@@ -355,7 +355,7 @@ if __name__ == "__main__":
                 # newconn.setblocking(False)
                 sockets[newconn.fileno()] = newconn  # save the socket
                 poller.register(newconn.fileno(), select.POLLIN)
-                logging.info('Accepted connection from: %s on fd %d ' 
+                logging.info('Accepted connection from: %s on fd %d '
                                 % (addr[0], newconn.fileno()))
             elif event is select.POLLIN:
                 conn = sockets[fd]  # get socket of the file descriptor
@@ -364,7 +364,8 @@ if __name__ == "__main__":
                     ccpkt = pickle.loads(data)
                     handle_ctrl_packet(conn, ccpkt)
                 except Exception as detail:
-                    logging.warning("Cannot receive from fd %d" % (fd, ))
+                    logging.warning("Cannot receive from fd %d. Error: %s"
+                                        % (fd, detail))
                     poller.unregister(fd)
                     del sockets[fd]
                     continue

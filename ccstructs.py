@@ -125,6 +125,7 @@ class Packet:
     """
     def __init__(self, mtype=-1, payload=None):
         self.mtype = mtype
+        self.stamp = datetime.now()
         self.payload = payload
 
     def __str__(self):

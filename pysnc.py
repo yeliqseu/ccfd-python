@@ -9,16 +9,19 @@ BAND_SNC = 1
 RLNC = 9
 
 # decoder types
-GG_DECODER = 0
-OA_DECODER = 1
-BD_DECODER = 2
+GG_DECODER  = 0
+OA_DECODER  = 1
+BD_DECODER  = 2
 CBD_DECODER = 3
+PP_DECODER  = 4
 
 # scheduling algorithm of recoder
-TRIV_SCHED = 0
-RAND_SCHED = 1
-MLPI_SCHED = 2
-
+TRIV_SCHED     = 0
+RAND_SCHED     = 1
+RAND_SCHED_SYS = 2
+MLPI_SCHED     = 3
+MLPI_SCHED_SYS = 4
+NURAND_SCHED   = 5
 
 class snc_context(Structure):
     pass
@@ -26,6 +29,7 @@ class snc_context(Structure):
 
 class snc_packet(Structure):
     _fields_ = [("gid",  c_int),
+                ("ucid",  c_int),
                 ("coes", POINTER(c_ubyte)),
                 ("syms", POINTER(c_ubyte))]
 
@@ -34,6 +38,7 @@ class snc_packet(Structure):
         """
         pktstr = bytearray()
         pktstr += c_int(self.gid)
+        pktstr += c_int(self.ucid)
         if bnc == 1:
             ce_len = int(ceil(size_g/8))  # Python 2/3 compatibility
         else:
@@ -47,13 +52,14 @@ class snc_packet(Structure):
         instance
         """
         self.gid = c_int.from_buffer_copy(pktstr)
+        self.ucid = c_int.from_buffer_copy(pktstr, sizeof(c_int))
         if bnc == 1:
             ce_len = int(ceil(size_g/8))  # Python 2/3 compatibility
         else:
             ce_len = size_g
-        coes = (c_ubyte * ce_len).from_buffer_copy(pktstr, sizeof(c_int))
+        coes = (c_ubyte * ce_len).from_buffer_copy(pktstr, 2*sizeof(c_int))
         memmove(self.coes, coes, ce_len)
-        syms = (c_ubyte * size_p).from_buffer_copy(pktstr, sizeof(c_int)+ce_len)
+        syms = (c_ubyte * size_p).from_buffer_copy(pktstr, 2*sizeof(c_int)+ce_len)
         memmove(self.syms, syms, size_p)
 
 

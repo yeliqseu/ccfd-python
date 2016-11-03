@@ -2,3 +2,4 @@
 *.pyc
 libsparsenc.so
 __pycache__
+*.log
