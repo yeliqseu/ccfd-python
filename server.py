@@ -6,7 +6,7 @@ import pickle
 import logging
 import copy
 import multiprocessing as mp
-from ccstructs import *
+from ccstruct import *
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(levelname)s: [%(asctime)s] %(message)s')
 
@@ -59,17 +59,17 @@ class Session:
             for fd, event in poller.poll():
                 if fd == self.fdc.fileno() and event is select.POLLIN:
                     pkt, ip = self.fdc.recv()
-                    logging.info("Session [%d] received msg <%s> from %s. Stamp: %s " %
-                                    (self.meta.sessionid, iMSG[pkt.mtype], ip, pkt.stamp))
-                    if pkt.mtype == MSG['REQ_SEG']:
+                    logging.info("Session [%d] received msg <%s> from %s." %
+                                    (self.meta.sessionid, iMSG[pkt.header.mtype], ip))
+                    if pkt.header.mtype == MSG['REQ_SEG']:
                         self.add_client(HostInfo(ip, self.meta.sessionid))
-                        self.fdc.send(Packet(MSG['OK']))
-                    elif pkt.mtype == MSG['HEARTBEAT']:
+                        self.fdc.send(CCPacket(CCHeader(MSG['OK'])))
+                    elif pkt.header.mtype == MSG['HEARTBEAT']:
                         self.client_heartbeat(ip)
-                        self.fdc.send(Packet(MSG['OK']))
-                    elif pkt.mtype == MSG['REQ_STOP'] or pkt.mtype == MSG['EXIT']:
+                        self.fdc.send(CCPacket(CCHeader(MSG['OK'])))
+                    elif pkt.header.mtype == MSG['REQ_STOP'] or pkt.header.mtype == MSG['EXIT']:
                         self.remove_client(ip)
-                        self.fdc.send(Packet(MSG['OK']))
+                        self.fdc.send(CCPacket(CCHeader(MSG['OK'])))
 
                 if fd == self.datasock.fileno() and event is select.POLLOUT:
                     # writable datasock, send data packets to clients
@@ -79,7 +79,8 @@ class Session:
                                                           self.meta.sp.size_p,
                                                           self.meta.sp.bnc)
                         try:
-                            self.datasock.sendto(pktstr, (cli.ip, port))
+                            # Construct data packet with serialized snc_packet
+                            self.datasock.sendto(CCPacket(CCHeader(MSG['DATA']), pktstr).packed(), (cli.ip, port))
                         except:
                             logging.warning("Caught exception in session %s."
                                                 % (self.meta.sessionid,))
@@ -171,12 +172,12 @@ def send_file_meta(conn, filename):
     Send meta information of a given filename
     """
     if not os.path.isfile(filename):
-        pkt = Packet(MSG['ERR_NOFILE'])
-        conn.send(pickle.dumps(pkt))
+        pkt = CCPacket(CCHeader(MSG['ERR_NOFILE']))
+        conn.send(pkt.packed())
     else:
         meta = MetaInfo(filename)
-        pkt = Packet(MSG['FILEMETA'], meta)
-        conn.send(pickle.dumps(pkt))
+        pkt = CCPacket(CCHeader(MSG['FILEMETA']), meta)
+        conn.send(pkt.packed())
 
 def send_peers_info(conn, session, ip):
     """
@@ -184,8 +185,10 @@ def send_peers_info(conn, session, ip):
     a list of peers that he can connect
     """
     peers = [cli.ip for cli in session.cooplist if cli.ip != ip]
-    pkt = Packet(MSG['PEERINFO'], peers)
-    conn.send(pickle.dumps(pkt))
+    if not peers:
+        peers = []
+    pkt = CCPacket(CCHeader(MSG['PEERINFO']), peers)
+    conn.send(pkt.packed())
 
 def find_session(sessions, segmeta):
     """
@@ -234,7 +237,7 @@ def call_session_process(session, msg):
     try:
         reply = session.fdp.recv()
         # print("Receive reply from session process")
-        if reply.mtype == MSG['OK']:
+        if reply.header.mtype == MSG['OK']:
             return 0
         else:
             return -1
@@ -266,18 +269,19 @@ def handle_ctrl_packet(conn, pkt):
     global sessions
     ip, port = conn.getpeername()
     logging.info("Server receives msg <%s> from %s " %
-                    (iMSG[pkt.mtype], ip))
-    session = find_session(sessions, pkt.payload)
-    if pkt.mtype == MSG['CHK_FILE']:
-        send_file_meta(conn, pkt.payload.filename)
-    if pkt.mtype == MSG['REQ_SEG']:
+                    (iMSG[pkt.header.mtype], ip))
+    session = find_session(sessions, pkt.body)
+    if pkt.header.mtype == MSG['CHK_FILE']:
+        send_file_meta(conn, pkt.body.filename)
+
+    elif pkt.header.mtype == MSG['REQ_SEG']:
         if session is None:
-            session = create_new_session(sessions, pkt.payload)
+            session = create_new_session(sessions, pkt.body)
         ret = call_session_process(session, (pkt, ip))
         if ret is 0:
-            pkt = Packet(MSG['SESSIONMETA'], session.meta)
+            pkt = CCPacket(CCHeader(MSG['SESSIONMETA']), session.meta)
             try:
-                conn.send(pickle.dumps(pkt))  # Send session's data
+                conn.send(pkt.packed())  # Send session's data
                 # Add to client list of the session
                 logging.info("Add %s into client list of segment %d"
                                 % (ip, session.meta.segmentid))
@@ -288,19 +292,21 @@ def handle_ctrl_packet(conn, pkt):
                                     % (ip, session.meta.segmentid, detail))
         else:
             logging.info("Call_cession_process return -1")
-    if pkt.mtype == MSG['HEARTBEAT']:
+    
+    elif pkt.header.mtype == MSG['HEARTBEAT']:
         if session is None:
             # No such session, error notice
             pass
         else:
             ret = call_session_process(session, (pkt, ip))
             if ret is 0:
-                conn.send(pickle.dumps(pkt))  # Echo back the heartbeat
+                conn.send(pkt.packed())  # Echo back the heartbeat
             else:
                 # Session no reply, error notice
                 pass
             session.client_heartbeat(addr[0])
-    if pkt.mtype == MSG['REQ_STOP']:
+    
+    elif pkt.header.mtype == MSG['REQ_STOP']:
         # remove client from session
         if session is None:
             # No such session, error notice to client
@@ -309,17 +315,19 @@ def handle_ctrl_packet(conn, pkt):
             ret = call_session_process(session, (pkt, ip))
             if ret is 0:
                 session.remove_client(ip)
-                conn.send(pickle.dumps(Packet(MSG['OK'], session.meta)))
+                conn.send(CCPacket(CCHeader(MSG['REQ_STOP_ACK']), session.meta).packed())
             else:
                 # Child no reply, error notice to client
                 pass
-    if pkt.mtype == MSG['CHK_PEERS']:
+    
+    elif pkt.header.mtype == MSG['CHK_PEERS']:
         if session is None:
             pass
         else:
             send_peers_info(conn, session, ip)
-        conn.close()
-    if pkt.mtype == MSG['EXIT']:
+        # conn.close()
+    
+    elif pkt.header.mtype == MSG['EXIT']:
         if session is None:
             return
         ret = call_session_process(session, (pkt, ip))
@@ -328,7 +336,7 @@ def handle_ctrl_packet(conn, pkt):
             # Remove the client from cooplist of all sessions
             for v in sessions.values():
                 v[0].remove_client_coop(ip)
-            conn.send(pickle.dumps(Packet(MSG['OK'])))
+            conn.send(CCPacket(CCHeader(MSG['EXIT_ACK'])).packed())
         else:
             pass
         conn.close()
@@ -361,7 +369,8 @@ if __name__ == "__main__":
                 conn = sockets[fd]  # get socket of the file descriptor
                 try:
                     data = conn.recv(BUFSIZE)
-                    ccpkt = pickle.loads(data)
+                    ccpkt = CCPacket()
+                    ccpkt.parse(data)
                     handle_ctrl_packet(conn, ccpkt)
                 except Exception as detail:
                     logging.warning("Cannot receive from fd %d. Error: %s"

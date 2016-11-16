@@ -4,10 +4,11 @@ import pickle
 import select
 import logging
 from datetime import datetime
-from ccstructs import *
+from ccstruct import *
 import multiprocessing as mp
 import copy
 import getopt
+from channel import *
 
 logging.basicConfig(stream=sys.stdout, level=logging.INFO, format='%(levelname)s: [%(asctime)s] %(message)s')
 HK_INTVAL = 15  # Housekeeping interval
@@ -59,229 +60,307 @@ class Cooperation:
     def __init__(self, serverhost, filemeta):
         self.server = serverhost
         self.filemeta = filemeta
-        self.poller = None    # poller of fds
         self.fdp = None       # fd of pipe of the parent side
         self.fdc = None       # fd of pipe of the child side
-        self.pcl = None       # TCP socket for peer ctrl
-        self.datasock = None  # UDP socket for data transmission
+        self.ppchid = None    # Pipe channel with parent process
+        self.pcchid = None    # Peer control channel
+        self.svchid = None    # Server channel id
         self.currsess = None  # Meta info of current session
-        self.sendpeers = []   # Peers cooperating on current session
-        self.sncbuf = {}      # Each segment has a snc buffer
+        self.sendpeers = {}   # Peers cooperating on current session
+                              # {'ip1': chanfd1, 'ip2': chanfd2}
         self.recvpeers = {}   # Each segment has a list of receiving peers
-        self.inconnip = {}    # Established in-bound peer TCP connections
-        self.inconnfd = {}    # fd-connection mapping of in-bound connections
-        self.outconn = {}     # Established out-bound TCP connections
+                              # {'segmentid': [ [hostinfo1, chfd1_c, chfd1_d],
+                              #                 [hostinfo2, chfd2_c, chfd2_d],
+                              #                 [...]
+                              #  'segmentid2': []
+                              # }
+        self.sncbuf = {}      # Each segment has a snc buffer
+        self.channels = {}    # Established channels (TCP, UDP, pipe) with other entities
+                              # I should have a channel with each sending peer (outconn), and two
+                              # channels with each receiving peer: 1) inconn for TCP control messages,
+                              # and 2) CH_TYEP_UDP_S for sending snc coded packets
+                              # Data structure: {ch_id: Channel()}
         self.availpeers = []  # Available peers that we may connect to
+        self.toexit = False   # Received EXIT notice from parent, will exit after cleaning every thing
         self.lastClean = datetime.now()
 
     def main(self):
         """ Main function of the cooperation process
         """
         self.fdp.close() # Close fdp on child side
-        # Setup TCP socket for receiving requests
-        self.pcl = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.pcl.settimeout(TIMEOUT)
-        self.pcl.bind(('', PORT+1))  # bind (PORT+1), specifically for sharing
-        self.pcl.listen(10)
-        # Setup UDP socket for sending recoded packets
-        self.datasock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Poll fdc, pcl, datasock, and established peer connections
-        # fdc      - messages from the parent (e.g., snc packets)
-        # pcl      - requests from new (or re-establishing) peers
-        # datasock - sending snc recoded packets to peers
-        self.poller = select.poll()  # poll fdc and datasock
-        self.poller.register(self.fdc.fileno(), select.POLLIN)
-        self.poller.register(self.pcl.fileno(), select.POLLIN)
-        self.poller.register(self.datasock.fileno(), select.POLLOUT)
+        # Establish pipe channel with parent process
+        self.ppchid = open_pipe_channel(self.channels, self.fdc)
+        # Setup peer control channel
+        self.pcchid = open_listen_channel(self.channels, PORT+1)
+
         logging.info("[COOP] Start main loop of cooperation...")
         while True:
-            for fd, event in self.poller.poll(1):
-                if event & (select.POLLHUP | select.POLLERR | select.POLLNVAL):
-                    # Remove broken file descriptors. (e.g. disconntected peers)
-                    # print("Unregister broken fd: %d" % (fd, ))
-                    if fd in self.inconnfd.keys():
-                        self.inconnip = {k: v for k, v in self.inconnip.items() if v != self.inconnfd[fd]}
-                        del self.inconnfd[fd]
-                    self.poller.unregister(fd)
-                elif fd == self.fdc.fileno() and event is select.POLLIN:
-                    """ message from parent (the decoder process)
-                         - session/snc_parameters
-                         - duplicated snc packets to buffer
-                         - exit sharing
-                    """
-                    pkt = self.fdc.recv()
-                    if pkt.mtype == MSG['NEW_SESSION']:
-                        sinfo = pkt.payload
-                        logging.info("[COOP] Create SNC buffer for segment %d"
-                                        % (sinfo.segmentid,))
-                        self.create_buffer(sinfo.segmentid, sinfo.sp)
-                        logging.info("[COOP] SNC buffer for segment %d created successfully"
-                                        % (sinfo.segmentid,))
-                        if self.currsess:
-                            logging.warning("[COOP] A session is currently marked as running.")
-                        self.currsess = sinfo  # set new current session
-                        # Check available peers from server
-                        peers = self.check_available_peers()
-                        if peers == []:
-                            logging.info("[COOP] No peers available to cooperate for now.")
-                            continue
-                        # Add available peers into list
-                        for peerip in peers:
-                            if peerip not in self.sendpeers and peerip not in self.availpeers:
-                                logging.info("[COOP] Add %s to available peer list." % (peerip, ))
-                                self.availpeers.append(peerip)
-                    if pkt.mtype == MSG['END_SESSION']:
-                        sinfo = pkt.payload
-                        logging.info("[COOP] End session %d (segment %d)"
-                                        % (sinfo.sessionid, sinfo.segmentid))
-                        if self.currsess:
-                            self.stop_recv_curr_session_all()
-                        self.sncbuf[self.currsess.segmentid][4] = True
-                        self.currsess = None
-                    if pkt.mtype == MSG['EXIT_PROC']:
-                        logging.info("[COOP] Clean up cooperation process before exiting...")
-                        for segid in self.recvpeers.keys():
-                            for peer in copy.deepcopy(self.recvpeers[segid]):
-                                # I'm exiting. Notify receiving peers.
-                                self.notify_exit_sending(peer.ip, segid)
-                            snc.snc_free_buffer(self.sncbuf[segid][1])
-                            snc.snc_free_packet(self.sncbuf[segid][2])
-                        logging.info("[COOP] Cooperation process exiting...")
-                        exit(0)
-                    if pkt.mtype == MSG['COOP_PKT']:
-                        logging.debug("[COOP] Get a coded packet from parent.")
-                        try:
-                            pkt_p = snc.snc_alloc_empty_packet(byref(self.currsess.sp))
-                            logging.debug("[COOP] Finished snc_alloc_empty_packet.")
-                            pkt_p.contents.deserialize(pkt.payload,
-                                                    self.currsess.sp.size_g,
-                                                    self.currsess.sp.size_p,
-                                                    self.currsess.sp.bnc)
-                            logging.debug("[COOP] Finished deserialize.")
-                            snc.snc_buffer_packet(self.sncbuf[self.currsess.segmentid][1], pkt_p)
-                            logging.debug("[COOP] Finished snc_buffer_packet.")
-                            self.sncbuf[self.currsess.segmentid][3] += 1
-                        except Exception as detail:
-                            logging.info("[COOP] Something wrong when buffering the packet", detail)
-                        logging.debug("[COOP] Finished buffering the coded packet from parent.")
-                    if pkt.mtype == MSG['HEARTBEAT']:
-                        # send heartbeat to peers on the sending list
-                        #FIXME: better to move it to where POLLOUT is handled
-                        self.heartbeat_sending_peers()
-                elif fd == self.pcl.fileno() and event is select.POLLIN:
-                    """ new control connection from a peer node
-                    """
-                    conn, addr = self.pcl.accept()
-                    peerip, port = conn.getpeername()
-                    # Check if there was outdated connection with this peer
-                    if peerip in self.inconnip.keys():
-                        del self.inconnip[peerip]
-                        logging.info("[COOP] Deleted the old connection as we get a new connection from %s." % (peerip, ))
-                    self.inconnip[peerip] = conn
-                    self.inconnfd[conn.fileno()] = conn
-                    self.poller.register(conn.fileno(), select.POLLIN)
-                    logging.info("[COOP] Accepted the new connection from %s on fd %d."
-                                    % (peerip, conn.fileno()))
-                elif event is select.POLLIN:
-                    """ Messages from established peer connections
-                         - ask for share
-                         - stop share
-                         - exiting
-                         - heartbeat
-                    """
-                    conn = self.inconnfd[fd]
-                    try:
-                        peerip, port = conn.getpeername()
-                        logging.info("[COOP] Message from %s is available on %d." % (peerip, fd))
-                        pkt = pickle.loads(conn.recv(BUFSIZE))
-                    except Exception as detail:
-                        logging.warning("[COOP] Message on fd %d not obtained. Error: %s"
-                                            % (fd, detail))
-                    if pkt.mtype == MSG['ASK_COOP']:
-                        sinfo = pkt.payload
-                        logging.info("[COOP] Get ASK_COOP [%s] from %s for segment %d."
-                                        % (pkt.stamp, peerip, sinfo.segmentid))
-                        if self.add_receiving_peer(peerip,
-                                                   sinfo.segmentid,
-                                                   sinfo.sessionid) == 0:
-                            try:
-                                conn.send(pickle.dumps(Packet(MSG['OK'])))
-                            except Exception as detail:
-                                logging.warning("[COOP] Cannot send OK to %s. Error: %s" % (peerip, detail))
-                        else:
-                            conn.send(pickle.dumps(Packet(MSG['ERR_PNOSEG'])))
-                        # If the peer is downloading the same segment as me, mark it as
-                        # an available peer for cooperation
-                        if (self.currsess is not None
-                            and sinfo.segmentid == self.currsess.segmentid
-                            and peerip not in self.sendpeers):
-                            logging.info("[COOP] Add %s to available peer list." % (peerip, ))
-                            self.availpeers.append(peerip)
-                    if pkt.mtype == MSG['STOP_COOP']:
-                        sinfo = pkt.payload
-                        logging.info("[COOP] Get STOP_COOP [%s] from %s for segment %d."
-                                        % (pkt.stamp, peerip, sinfo.segmentid))
-                        if self.remove_receiving_peer(peerip, sinfo.segmentid) == 0:
-                            conn.send(pickle.dumps(Packet(MSG['OK'])))
-                        else:
-                            conn.send(pickle.dumps(Packet(MSG['ERR_PNOTFOUND'])))
-                        #FIXME: we might need to shutdown the established in-bound connection
-                        #       because the connections are per session (i.e., segment).
-                        self.poller.unregister(fd)
-                        conn.close()
-                        del self.inconnip[peerip]
-                        del self.inconnfd[fd]
-                    if pkt.mtype == MSG['EXIT_COOP']:
-                        segmentid = pkt.payload
-                        logging.info("[COOP] Get EXIT_COOP [%s] from %s for segment %d."
-                                        % (pkt.stamp, peerip, segmentid))
-                        if self.remove_sending_peer(peerip, segmentid) == 0:
-                            conn.send(pickle.dumps(Packet(MSG['OK'])))
-                        else:
-                            conn.send(pickle.dumps(Packet(MSG['ERR_PNOTFOUND'])))
-                        # Shutdown the in-bound connection of the peer
-                        self.poller.unregister(fd)
-                        conn.close()
-                        del self.inconnip[peerip]
-                        del self.inconnfd[fd]
-                        # Shutdown the out-bound connection to the peer
-                        if peerip in self.outconn.keys():
-                            self.outconn[peerip].close()
-                            del self.outconn[peerip]
-                    if pkt.mtype == MSG['HEARTBEAT']:
-                        # Update heartbeat of the peer on receiving list
-                        segmentid = pkt.payload.segmentid
-                        logging.info("[COOP] Get HEARTBEAT [%s] from %s for segment %d."
-                                        % (pkt.stamp, peerip, segmentid))
-                        if self.update_peer_heartbeat(peerip, segmentid) == 0:
-                            conn.send(pickle.dumps(Packet(MSG['OK'])))
-                        else:
-                            conn.send(pickle.dumps(Packet(MSG['ERR_PNOTFOUND'])))
-                elif fd == self.datasock.fileno() and event is select.POLLOUT:
-                    """ send recoded packets
-                    """
-                    for sid in self.recvpeers.keys():
-                        if self.sncbuf[sid][3] < 100 and not self.sncbuf[sid][4]:
-                            # not sending cooperative packets if the buffer is not updated much
-                            continue
-                        for peer in self.recvpeers[sid]:
-                            snc.snc_recode_packet_im(self.sncbuf[sid][1],
-                                                     self.sncbuf[sid][2],
-                                                     MLPI_SCHED)
-                            pktstr = self.sncbuf[sid][2][0].serialize(self.sncbuf[sid][0].size_g,
-                                                                      self.sncbuf[sid][0].size_p,
-                                                                      self.sncbuf[sid][0].bnc)
-                            try:
-                                self.datasock.sendto(pktstr, (peer.ip, UDP_START+peer.sessionid))
-                            except:
-                                logging.warning("[COOP] Caught exception sending to %s for segment %d."
-                                                    % (peer.ip, sid))
-                        self.sncbuf[sid][3] = 0 # reset new buffered counter
-            # Try to connect to available peers to cooperate the current segment
-            if len(self.availpeers) != 0:
-                self.connect_to_available_peers()
-            # Housekeeping to clean inactive peers
+            poll_channels(self.channels)
+
+            # Accept connections on pcl
+            pcl_ch = self.channels[self.pcchid]
+            if pcl_ch.eventmask & CH_READ:
+                self.accept_connection(pcl_ch.handle)
+
+            # perform control IO on all channels
+            self.client_IO(self.channels)
+
+            # perform recoding and send data packets if it's time
+            self.recode_and_send()
+
+            # do housekeeping, clean up outdated/failed stuff
             self.housekeeping()
+
+    def accept_connection(self, listen_s):
+        conn, addr = listen_s.accept()
+        peerip, port = conn.getpeername()
+        chid = open_inconn_channel(self.channels, conn)
+        logging.info("[COOP] Accepted the new connection from %s, channel id: %d."
+                        % (peerip, chid))
+
+    def client_IO(self, chans):
+        # receive from parent pipe
+        pipe_ch = self.channels[self.ppchid]
+        if (pipe_ch.eventmask & CH_READ):
+            # read message
+            logging.debug("[COOP] Pipe channel is readable.")
+            while True:
+                msg = pipe_ch.receive()
+                # logging.info("[COOP] Message received on pipe channel: %s" % (msg,))
+                if not msg:
+                    break
+                pkt = CCPacket()
+                pkt.parse(msg)
+                if pkt.header.mtype != MSG['DATA']:
+                    logging.debug("[COOP] Receive %s from parent process" % (iMSG[pkt.header.mtype],))
+                self.process_parent(pkt)
+
+        # receive from server port (peerinfo only so far)
+        if self.svchid:
+            serv_ch = self.channels[self.svchid]
+            if (serv_ch.eventmask & CH_READ):
+                logging.debug("[COOP] Server channel is readable.")
+                while True:
+                    msg = serv_ch.receive()
+                    if not msg:
+                        break
+                    pkt = CCPacket()
+                    pkt.parse(msg)
+                    logging.info("[COOP] Receive %s from server host" % (iMSG[pkt.header.mtype],))
+                    if pkt.header.mtype == MSG['PEERINFO']:
+                        peerlist = pkt.body
+                        logging.info('Available peers: %s' % (peerlist, ))
+                        self.connect_to_available_peers(peerlist)
+                serv_ch.state = CH_STATE_CLOSE  # Mark the channel as to-be-closed
+                self.svchid = None
+
+        # Process other channels which are from peer nodes
+        # We should iterate over peers instead of channels, because channel list
+        # may change during iteration
+        # Process
+        for chid in list(self.channels):
+            ch = self.channels[chid]
+            if (ch.eventmask & CH_READ):
+                while True:
+                    msg = ch.receive()
+                    # logging.info("[COOP] Message received on pipe channel: %s" % (msg,))
+                    if not msg:
+                        break
+                    pkt = CCPacket()
+                    pkt.parse(msg)
+                    # logging.info("[COOP] Receive %s from %s" % (iMSG[pkt.header.mtype], ch.remote[0]))
+                    self.process_peer(chid, pkt)
+        return
+
+    def process_parent(self, pkt):
+        if pkt.header.mtype == MSG['DATA']:
+            logging.debug("[COOP] Get a coded packet from parent.")
+            try:
+                pkt_p = snc.snc_alloc_empty_packet(byref(self.currsess.sp))
+                logging.debug("[COOP] Finished snc_alloc_empty_packet.")
+                pkt_p.contents.deserialize(pkt.body,
+                                        self.currsess.sp.size_g,
+                                        self.currsess.sp.size_p,
+                                        self.currsess.sp.bnc)
+                logging.debug("[COOP] Finished deserialize.")
+                snc.snc_buffer_packet(self.sncbuf[self.currsess.segmentid][1], pkt_p)
+                logging.debug("[COOP] Finished snc_buffer_packet.")
+                self.sncbuf[self.currsess.segmentid][3] += 1
+            except Exception as detail:
+                logging.info("[COOP] Something wrong when buffering the packet", detail)
+            logging.debug("[COOP] Finished buffering the coded packet from parent.")
+
+        elif pkt.header.mtype == MSG['NEW_SESSION']:
+            sinfo = pkt.body
+            logging.info("[COOP] Create SNC buffer for segment %d"
+                            % (sinfo.segmentid,))
+            self.create_buffer(sinfo.segmentid, sinfo.sp)
+            logging.info("[COOP] SNC buffer for segment %d created successfully"
+                            % (sinfo.segmentid,))
+            if self.currsess:
+                logging.warning("[COOP] A session is currently marked as running.")
+            self.currsess = sinfo  # set new current session
+            # Establish a connection to server to check available peers
+            self.svchid = open_outconn_channel(self.channels, self.server, PORT)
+            logging.info("[COOP] Opened channel to server host, channel id: %d" % (self.svchid, ))
+            reply = CCPacket(CCHeader(MSG['CHK_PEERS']), self.currsess)
+            self.channels[self.svchid].send(reply.packed())
+            logging.info("[COOP] Enqueued CHK_PEERS to server channel (chid: %d)." % (self.svchid, ))
+
+        elif pkt.header.mtype == MSG['END_SESSION']:
+            sinfo = pkt.body
+            logging.info("[COOP] End session %d (segment %d)"
+                            % (sinfo.sessionid, sinfo.segmentid))
+            if self.currsess:
+                self.stop_recv_curr_session_all()
+            self.sncbuf[self.currsess.segmentid][4] = True
+            # clean up sending list for the segment
+            logging.info("[COOP] Clean up sending peer list for segment %d" % (self.currsess.segmentid, ))
+            self.sendpeers = {}
+            self.currsess = None
+
+        elif pkt.header.mtype == MSG['EXIT_PROC']:
+            logging.info("[COOP] Clean up cooperation process before exiting...")
+            logging.info("[COOP] Time to exit. Check sendpeers and recvpeers")
+            logging.info("[COOP] sendpeers: %s" % (self.sendpeers,))
+            logging.info("[COOP] recvpeers: %s" % (self.recvpeers,))
+            for segid in self.recvpeers.keys():
+                for st in copy.deepcopy(self.recvpeers[segid]):
+                    # Note: each segmentid corresponds to a list of [hostinfo, chid_ctrl, chid_data]
+                    # I'm exiting. Notify receiving peers.
+                    peerip = st[0].ip
+                    self.notify_exit_sending(peerip, segid)
+            self.toexit = True
+
+        elif pkt.header.mtype == MSG['HEARTBEAT']:
+            # send heartbeat to peers on the sending list
+            self.heartbeat_sending_peers()
+
+    def process_peer(self, chid, pkt):
+        ch = self.channels[chid]
+        peerip = ch.remote[0]
+
+        if pkt.header.mtype == MSG['ASK_COOP']:
+            sinfo = pkt.body
+            logging.info("[COOP] Get ASK_COOP [] from %s on channel (chid: %d) for segment %d."
+                            % (peerip, chid, sinfo.segmentid))
+            # ``Establish'' UDP data channel to the host
+            chid_d = self.add_receiving_peer(peerip, sinfo.segmentid, sinfo.sessionid, chid)
+            if chid_d >= 0:
+                reply = CCPacket(CCHeader(MSG['ASK_COOP_ACK']), sinfo)
+                logging.info("[COOP] Enqueue ASK_COOP_ACK onto channel (chid: %d) to %s for segment %d."
+                                        % (chid, peerip, sinfo.segmentid))
+                logging.info("[COOP] Data channel to %s for segment %d is : %d"
+                                        % (peerip, sinfo.segmentid, chid_d))
+                ch.send(reply.packed())
+            else:
+                reply = CCPacket(CCHeader(MSG['ERR_PNOSEG']), sinfo)
+                ch.send(reply.packed())
+                logging.warning("[COOP] Enqueue ERR_PNOSEG onto channel (chid: %d) to %s for segment %d."
+                                        % (chid, peerip, sinfo.segmentid))
+                self.channels[chid].state = CH_STATE_CLOSE
+            # If the peer is downloading the same segment as me, ask for his help too
+            if (self.currsess is not None
+                and sinfo.segmentid == self.currsess.segmentid
+                and peerip not in self.sendpeers):
+                self.connect_to_available_peers([peerip])
+            elif (self.currsess is not None
+                and sinfo.segmentid == self.currsess.segmentid
+                and peerip in self.sendpeers):
+                logging.info("[COOP] Peer %s is already a sendpeer of segment %d, pass." %
+                                (peerip, self.currsess.segmentid))
+
+        elif pkt.header.mtype == MSG['ASK_COOP_ACK']:
+            sinfo = pkt.body
+            peerip = ch.remote[0]
+            logging.info("[COOP] Get ASK_COOP_ACK [] from %s on channel (chid: %d) for segment %d."
+                            % (peerip, chid, sinfo.segmentid))
+            if (self.currsess is not None and sinfo.segmentid == self.currsess.segmentid):
+                self.add_sending_peer(peerip, chid)
+
+        elif pkt.header.mtype == MSG['STOP_COOP']:
+            sinfo = pkt.body
+            logging.info("[COOP] Get STOP_COOP [] from %s on channel (chid: %d)  for segment %d."
+                            % ( peerip, chid, sinfo.segmentid))
+            # Just remove peer from recvpeer list, doesn't need to ack
+            if self.remove_receiving_peer(peerip, sinfo.segmentid) == 0:
+                pass
+            else:
+                pass
+            # shutdown the channel
+            self.channels[chid].state = CH_STATE_CLOSE
+
+        elif pkt.header.mtype == MSG['EXIT_COOP']:
+            segmentid = pkt.body
+            logging.info("[COOP] Get EXIT_COOP [] from %s on channel (chid: %d) for segment %d."
+                            % ( peerip, chid, segmentid))
+            if self.remove_sending_peer(peerip, segmentid) == 0:
+                reply = CCPacket(CCHeader(MSG['EXIT_COOP_ACK']), segmentid)
+            else:
+                reply = CCPacket(CCHeader(MSG['EXIT_COOP_NOPEER']), segmentid)
+            ch.send(reply.packed())
+            logging.info("[COOP] Enqueue %s onto channel (chid: %d) to %s for segment %d."
+                                    % (iMSG[reply.header.mtype], chid, peerip, segmentid))
+            self.channels[chid].state = CH_STATE_CLOSE
+
+        elif pkt.header.mtype == MSG['EXIT_COOP_ACK'] or\
+                pkt.header.mtype == MSG['EXIT_COOP_NOPEER']:
+            segmentid = pkt.body
+            logging.info("[COOP] Get %s [] from %s on channel (chid: %d) for segment %d."
+                            % ( iMSG[pkt.header.mtype], peerip, chid, segmentid))
+            self.remove_receiving_peer(peerip, segmentid)
+            self.channels[chid].state = CH_STATE_CLOSE
+
+        elif pkt.header.mtype == MSG['HEARTBEAT']:
+            # Update heartbeat of the peer on receiving list
+            sinfo = pkt.body
+            segmentid = pkt.body.segmentid
+            logging.info("[COOP] Get HEARTBEAT [] from %s on channel (chid: %d) for segment %d."
+                            % ( peerip, chid, segmentid))
+            if self.update_peer_heartbeat(peerip, segmentid) == 0:
+                reply = CCPacket(CCHeader(MSG['HEARTBEAT_ACK']), sinfo)
+                ch.send(reply.packed())
+                logging.info("[COOP] Enqueue %s onto channel (chid: %d) to %s for segment %d."
+                                        % (iMSG[reply.header.mtype], chid, peerip, segmentid))
+            else:
+                reply = CCPacket(CCHeader(MSG['ERR_PNOTFOUND']), sinfo)
+                ch.send(reply.packed())
+                logging.info("[COOP] Enqueue %s onto channel (chid: %d) to %s for segment %d."
+                                        % (iMSG[reply.header.mtype], chid, peerip, segmentid))
+
+        elif pkt.header.mtype == MSG['HEARTBEAT_ACK']:
+            sinfo = pkt.body
+            segmentid = pkt.body.segmentid
+            logging.info("[COOP] Get HEARTBEAT_ACK [] from %s on channel (chid: %d) for segment %d."
+                            % ( peerip, chid, segmentid))
+
+        elif pkt.header.mtype == MSG['ERR_PNOTFOUND']:
+            sinfo = pkt.body
+            logging.info("[COOP] Get ERR_PNOTFOUND [] from %s on channel (chid: %d) for segment %d."
+                            % ( peerip, chid, segmentid))
+            logging.info("[COOP] Let's remove peer %s from sending list." % (peerip, ))
+            self.remove_sending_peer(peerip, sinfo.segmentid)
+            self.channels[chid].state = CH_STATE_CLOSE
+
+    def recode_and_send(self):
+        # go through recv peers
+        # recv peers have two chanels: TCP (for control) and UDP (for data)
+        for segid in self.recvpeers:
+            # not sending cooperative packets if the buffer is not updated much
+            if self.sncbuf[segid][3] < 100 and not self.sncbuf[segid][4]:
+                logging.debug("[COOP] Not time to recode and send for segment %d" % (segid, ))
+                continue
+            for entity in self.recvpeers[segid]:
+                ch = self.channels[entity[2]]  # data channel
+                snc.snc_recode_packet_im(self.sncbuf[segid][1], self.sncbuf[segid][2], MLPI_SCHED)
+                pktstr = self.sncbuf[segid][2][0].serialize(self.sncbuf[segid][0].size_g,
+                                                            self.sncbuf[segid][0].size_p,
+                                                            self.sncbuf[segid][0].bnc)
+                ch.send(CCPacket(CCHeader(MSG['DATA']), pktstr).packed())
+                logging.debug("[COOP] Enqueued DATA onto channel (chid: %d) to %s for segment %d"
+                            % (ch.chid, entity[0].ip, segid))
+            self.sncbuf[segid][3] = 0 # reset new buffered counter
+        return
 
     def create_buffer(self, segmentid, sp):
         """ Create snc buffer for a segment and a given snc_parameters
@@ -296,117 +375,36 @@ class Cooperation:
             logging.error("Create buffer failed: %s" % (detail, ))
         return
 
-    def check_available_peers(self):
-        """ Check out peer list of current session from server
-        """
-        # Check peers list of the session
-        pkt = Packet(MSG['CHK_PEERS'], self.currsess)
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(TIMEOUT)
-        try:
-            s.connect((self.server, PORT))
-            s.send(pickle.dumps(pkt))
-            reply = pickle.loads(s.recv(BUFSIZE))
-            peers = reply.payload
-            logging.info(("[COOP] Available peers according to server: ["
-                           +', '.join(['%s']*len(peers))+"]") % tuple(peers))
-        except Exception as detail:
-            logging.warning("[COOP] Cannot connect to the server. Error: %s " % (detail, ))
-            peers = []
-        s.close()
-        return peers
-
-    def establish_connection(self, peerip):
-        """ Establish out-bound connections to other peers. The connections
-            are only used for sending control messages.
-
-            On the peer side, the connections are accepted and handled in poller().
-        """
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.settimeout(TIMEOUT)
-        try:
-            s.connect((peerip, PORT+1))
-        except Exception as detail:
-            logging.warning("[COOP] Cannot connect to peer %s. Error: %s" % (peerip, detail))
-            s.close()
-            return -1
-        self.outconn[peerip] = s
-        logging.info("[COOP] Established out-bound connection to %s." % (peerip, ))
-        return 0
-
-    def connect_to_available_peers(self):
+    def connect_to_available_peers(self, availpeers):
         """ Connect to available peers. Request their help on current segment.
             It will establish a connection to the peer's pcl socket and store
             the established connection in outconn[]. If the connection wasn't
             successful, the peer is removed from available
         """
         logging.info("[COOP] Connect to available peers...")
+        if len(availpeers) == 0:
+            logging.info("[COOP] Empty available peer list.")
+            return
         # print(self.availpeers)
-        for peerip in copy.deepcopy(self.availpeers):
-            logging.info("[COOP] Connecting to peer %s..." % (peerip, ))
-            if self.establish_connection(peerip) == -1:
-                logging.warning("[COOP] Skip requesting peer %s for help; remove it." % (peerip,))
-                self.availpeers.remove(peerip)
-                continue
-            conn = self.outconn[peerip] # the established connection
-            pkt = Packet(MSG['ASK_COOP'], self.currsess)
-            logging.info("[COOP] Sending ASK_COOP [%s] to %s for segment %d."
-                            % (pkt.stamp, peerip, self.currsess.segmentid))
-            try:
-                conn.send(pickle.dumps(pkt))
-                ret = pickle.loads(conn.recv(BUFSIZE))
-                logging.info("[COOP] Peer %s returns message %s " % (peerip, iMSG[ret.mtype]))
-                if ret.mtype == MSG['OK']:
-                    logging.info("[COOP] Peer %s acknowledged my request of sending segment %d."
-                                    % (peerip, self.currsess.segmentid))
-                    self.add_sending_peer(peerip)
-                    logging.info("[COOP] Added %s to sending list of segment %d."
-                                    % (peerip, self.currsess.segmentid))
-                    logging.info(("[COOP] Current sending list: ["
-                                    +', '.join(['%s']*len(self.sendpeers))+"]")
-                                    % tuple(self.sendpeers))
-                elif ret.mtype == MSG['ERR_PNOSEG']:
-                    logging.warning("[COOP] Peer %s does not have segment %d."
-                                        % (peerip, self.currsess.segmentid))
-            except Exception as detail:
-                logging.warning("[COOP] Cannot send to %s. Error: %s" % (peerip, detail))
-                conn.close()
-                del self.outconn[peerip]
-            self.availpeers.remove(peerip)
+        for peerip in copy.deepcopy(availpeers):
+            logging.info("[COOP] Initiate outconn channel to peer %s..." % (peerip, ))
+            chid = open_outconn_channel(self.channels, peerip, PORT+1)
+            pkt = CCPacket(CCHeader(MSG['ASK_COOP']), self.currsess)
+            logging.info("[COOP] Enqueued ASK_COOP [] onto channel (chid: %d) to %s for segment %d."
+                            % (chid, peerip, self.currsess.segmentid))
+            self.channels[chid].send(pkt.packed())
+            availpeers.remove(peerip)
 
     def stop_recv_curr_session(self, peerip):
         """ Notify a peer to stop sending packets for current session
         """
-        if peerip not in self.outconn.keys():
-            if self.establish_connection(peerip) == -1:
-                logging.warning("[COOP] Skip notifying peer %s to stop sending." % (peerip,))
-                self.sendpeers.remove(peerip)
-                logging.info("[COOP] Removed %s from sending list of segment %d."
-                                % (peerip, self.currsess.segmentid))
-                return
-        conn = self.outconn[peerip]
-        pkt = Packet(MSG['STOP_COOP'], self.currsess)
-        logging.info("[COOP] Sending STOP_COOP [%s] to %s for segment %d."
-                        % (pkt.stamp, peerip, self.currsess.segmentid))
-        try:
-            conn.send(pickle.dumps(pkt))
-            ret = pickle.loads(conn.recv(BUFSIZE))
-            logging.info("[COOP] Peer %s returns message %s [%s]"
-                            % (peerip, iMSG[ret.mtype], ret.stamp))
-            if ret.mtype == MSG['OK']:
-                logging.info("[COOP] Peer %s acknowledged my request of stopping segment %d."
-                                % (peerip, self.currsess.segmentid))
-            else:
-                logging.warning("[COOP] Peer %s doesn't have me on recv-list of segment %d."
-                                % (peerip, self.currsess.segmentid))
-        except Exception as detail:
-            logging.warning("[COOP] Cannot send STOP_COOP to %s. Error: %s" % (peerip, detail))
-            conn.close()
-            del self.outconn[peerip]
-        # Aways remove the peer from sending list.
-        self.sendpeers.remove(peerip)
-        logging.info("[COOP] Removed %s from sending list of segment %d."
-                        % (peerip, self.currsess.segmentid))
+        chid = self.sendpeers[peerip]
+        ch = self.channels[chid]
+        pkt = CCPacket(CCHeader(MSG['STOP_COOP']), self.currsess)
+        logging.info("[COOP] Enqueue STOP_COOP onto channel (chid: %d) to %s for segment %d."
+                                % (chid, peerip, self.currsess.segmentid))
+        ch.send(pkt.packed())
+        ch.state = CH_STATE_CLOSE
 
     def stop_recv_curr_session_all(self):
         """ Stop peers sending me packets of current segment
@@ -418,37 +416,28 @@ class Cooperation:
     def notify_exit_sending(self, peerip, segmentid):
         """ Notify remote peer that I'll stop sending a segment
         """
-        if peerip not in self.outconn.keys():
-            if self.establish_connection(peerip) == -1:
-                logging.warning("[COOP] Skip notifying peer %s of my exit." % (peerip,))
-                self.remove_receiving_peer(peerip, segmentid)
-                return
-        conn = self.outconn[peerip]
-        pkt = Packet(MSG['EXIT_COOP'], segmentid)
-        logging.info("[COOP] Send EXIT_COOP [%s] to %s for segment %d."
-                        % (pkt.stamp, peerip, segmentid))
-        try:
-            conn.send(pickle.dumps(pkt))
-            ret = pickle.loads(conn.recv(BUFSIZE))
-            logging.info("[COOP] Peer %s returns message %s" % (peerip, iMSG[ret.mtype]))
-            if ret.mtype == MSG['OK']:
-                logging.info("[COOP] Peer %s acknowledged my exit of sending segment %d."
-                                % (peerip, segmentid))
-            else:
-                logging.warning("[COOP] Peer %s doesn't have me on send-list of segment %d."
-                                    % (peerip, segmentid))
-        except Exception as detail:
-            logging.warning("[COOP] Cannot connect to peer %s. Error: %s" % (peerip, detail))
-            conn.close()
-            del self.outconn[peerip]
-        self.remove_receiving_peer(peerip, segmentid)
+        # Find receiving peer's inconn control channel
+        chid = -1
+        for entity in self.recvpeers[segmentid]:
+            if entity[0].ip == peerip:
+                chid = entity[1]
+                break
+        if chid < 0:
+            logging.warning("[COOP] Cannot find %s in notify_exiting_sending()" % (peerip,))
+            return
+        ch = self.channels[chid]
+        pkt = CCPacket(CCHeader(MSG['EXIT_COOP']), segmentid)
+        ch.send(pkt.packed())
+        logging.info("[COOP] Enqueue EXIT_COOP [] onto channel (chid: %d) to %s for segment %d."
+                        % (chid, peerip, segmentid))
         return
 
-    def add_receiving_peer(self, peerip, segmentid, sessionid):
+    def add_receiving_peer(self, peerip, segmentid, sessionid, chid_c):
         """ Add peer to cooperation list of (receiving) a segment
+            chid_c - control channel id
             Return
-                 0  - Add successfully
-                -1  - Request segment not available
+                >=0  - Add successfully, return data channel id
+                -1   - Request segment not available
         """
         if segmentid not in self.sncbuf:
             # segment not seen
@@ -456,20 +445,28 @@ class Cooperation:
                             % (segmentid, peerip))
             return -1
         if segmentid not in self.recvpeers.keys():
-            # first peer in list; initialize
+            # first peer for the segment, initialize peer list
             self.recvpeers[segmentid] = []
-        if peerip in [p.ip for p in self.recvpeers[segmentid]]:
+        if peerip in [p[0].ip for p in self.recvpeers[segmentid]]:
             logging.warning("[COOP] %s is already in receiving list of segment %d."
                                 % (peerip, segmentid))
+            # find out the peer and return its data channel id
+            for entity in self.recvpeers[segmentid]:
+                if entity[0].ip == peerip:
+                    # FIXME: Let's close previous ctrl channel, and replace with the new one
+                    # self.channels[entity[1]].state = CH_STATE_CLOSE
+                    # entity[1] = chid_c
+                    return entity[2]
         else:
             peer = HostInfo(peerip, sessionid)
-            self.recvpeers[segmentid].append(peer)
+            chid_d = open_data_channel(self.channels, peerip, UDP_START+sessionid)
+            self.recvpeers[segmentid].append([peer, chid_c, chid_d])
             logging.info("[COOP] Added %s to receiving list of segment %d."
                             % (peerip, segmentid))
-            peerips = [p.ip for p in self.recvpeers[segmentid]]
+            peerips = [p[0].ip for p in self.recvpeers[segmentid]]
             logging.info(("[COOP] Current receiving list of the segment ["
                            +', '.join(['%s']*len(peerips))+"]") % tuple(peerips))
-        return 0
+            return chid_d
 
     def remove_receiving_peer(self, peerip, segmentid):
         """ Remove a peer from recv-list of a segment. The peer
@@ -484,28 +481,43 @@ class Cooperation:
                                 % (segmentid, ))
             return -1
         found = False
-        for peer in self.recvpeers[segmentid]:
-            if peer.ip == peerip:
+        for entity in self.recvpeers[segmentid]:
+            if entity[0].ip == peerip:
                 found = True
-                self.recvpeers[segmentid].remove(peer)
+                chid_c = entity[1]
+                self.channels[chid_c].state = CH_STATE_CLOSE
+                chid_d = entity[2]
+                self.channels[chid_d].state = CH_STATE_CLOSE
+                self.recvpeers[segmentid].remove(entity)
                 logging.info("[COOP] Removed %s from receiving list of segment %s"
                                 % (peerip, segmentid))
-                return 0
-        if not found:
+                break
+        if found:
+            if len(self.recvpeers[segmentid]) == 0:
+                logging.info("[COOP] recv peer list of segment %d is now empty." % (segmentid, ))
+                del self.recvpeers[segmentid]
+            return 0
+        else:
             logging.warning("[COOP] %s is not found in receiving list of segment %d."
                                 % (peerip, segmentid))
             return -1
 
-    def add_sending_peer(self, peerip):
+    def add_sending_peer(self, peerip, chid):
         """ Add a peer to the send list of current session
             TO EXTEND: A host may receiving multiple sessions at a time.
             In this case, there would be multiple sending lists being
             maintained at a time.
         """
         if peerip and peerip not in self.sendpeers:
-            self.sendpeers.append(peerip)
+            self.sendpeers[peerip] = chid
             return 0
         else:
+            logging.warning("[COOP] %s is already in sendpeers for segment %d, previous ctrl channel id: %d" % (peerip, 
+                                                     self.currsess.segmentid, 
+                                                     self.sendpeers[peerip]))
+            # logging.info("[COOP] replace ctrl channel to %s with new id %d" % (peerip, chid))
+            # self.channels[self.sendpeers[peerip]].state = CH_STATE_CLOSE
+            # self.sendpeers[peerip] = chid
             return -1
 
     def remove_sending_peer(self, peerip, segmentid):
@@ -513,7 +525,7 @@ class Cooperation:
         """
         if self.currsess.segmentid == segmentid \
             and peerip in self.sendpeers:
-            self.sendpeers.remove(peerip)
+            del self.sendpeers[peerip]
             logging.info("Done. Remove %s from sending list of segment %s."
                             % (peerip, segmentid))
             return 0
@@ -525,28 +537,13 @@ class Cooperation:
     def heartbeat_sending_peers(self):
         """ Send heartbeat signal to peers sending packets to me
         """
-        pkt = Packet(MSG['HEARTBEAT'], self.currsess)
+        pkt = CCPacket(CCHeader(MSG['HEARTBEAT']), self.currsess)
         for peerip in self.sendpeers:
-            if peerip not in self.outconn.keys():
-                if self.establish_connection(peerip) == -1:
-                    logging.warning("[COOP] Skip sending heartbeat to %s." % (peerip,))
-                    return
-            conn = self.outconn[peerip]
-            logging.info("[COOP] Sending HEARTBEAT [%s] to %s for segment %d."
-                            % (pkt.stamp, peerip, self.currsess.segmentid))
-            try:
-                conn.send(pickle.dumps(pkt))
-                ret = pickle.loads(conn.recv(BUFSIZE))
-                logging.info("[COOP] Peer %s returns message %s" % (peerip, iMSG[ret.mtype]))
-                if ret.mtype == MSG['OK']:
-                    logging.info("[COOP] Peer %s acknowledged my hearbeat about segment %d."
-                                    % (peerip, self.currsess.segmentid))
-            except Exception as detail:
-                logging.warning("[COOP] Cannot send to %s. Error: %s" % (peerip, detail))
-                # FIXME: If no reply from the peer, shoudl remove the peer from
-                # the sending list of the segment.
-                conn.close()
-                del self.outconn[peerip]
+            chid = self.sendpeers[peerip]
+            ch = self.channels[chid]
+            ch.send(pkt.packed())
+            logging.info("[COOP] Enqueued HEARTBEAT [] onto channel (chid: %d) to %s for segment %d."
+                            % ( chid, peerip, self.currsess.segmentid))
 
     def update_peer_heartbeat(self, peerip, segmentid):
         if segmentid not in self.recvpeers:
@@ -555,17 +552,24 @@ class Cooperation:
                                 % (segmentid, ))
             return -1
         found = False
-        for i, peer in enumerate(self.recvpeers[segmentid]):
-            if peer.ip == peerip:
+        for entity in self.recvpeers[segmentid]:
+            if entity[0].ip == peerip:
                 found = True
-                peer.set_heartbeat()
-                self.recvpeers[segmentid][i] = peer
+                entity[0].set_heartbeat()
+                return 0
+        """
+        for i, entity in enumerate(self.recvpeers[segmentid]):
+            if entity[0].ip == peerip:
+                found = True
+                entity[0].set_heartbeat()
+                self.recvpeers[segmentid][i] = entity[0]
                 logging.info("[COOP] Updated heartbeat of %s in receiving list of segment %s"
                                 % (peerip, segmentid))
-                peerips = [p.ip for p in self.recvpeers[segmentid]]
-                logging.info(("[COOP] Current receiving list of the segment ["
-                               +', '.join(['%s']*len(peerips))+"]") % tuple(peerips))
+                # peerips = [p[0].ip for p in self.recvpeers[segmentid]]
+                # logging.info(("[COOP] Current receiving list of the segment ["
+                #               +', '.join(['%s']*len(peerips))+"]") % tuple(peerips))
                 return 0
+        """
         if not found:
             logging.warning("[COOP] %s is not found in receiving list of segment %d."
                                 % (peerip, segmentid))
@@ -579,13 +583,24 @@ class Cooperation:
         if (now - self.lastClean).seconds > HK_INTVAL:
             logging.info("[COOP] Coopeartion process do housekeeping...")
             # Clean up no heartbeat clients
-            for segid in self.recvpeers.keys():
-                for peer in copy.deepcopy(self.recvpeers[segid]):
+            for segid in list(self.recvpeers):
+                for entity in copy.deepcopy(self.recvpeers[segid]):
+                    peer = entity[0]
                     if (now - peer.lastBeat).seconds > HK_INTVAL:
                         logging.info("[COOP] Remove peer %s from segment %d because no heartbeat"
                                         % (peer.ip, segid))
                         self.remove_receiving_peer(peer.ip, segid)
             self.lastClean = now
+        # Cooperation exit if parent has told to do so and everything is cleaned
+        if self.toexit:
+            if not self.sendpeers and not self.recvpeers:
+                # Let's free snc buffers
+                for segid in list(self.sncbuf):
+                    logging.info("[COOP] Freeing SNC buffer for segment %d" % (segid, ))
+                    snc.snc_free_buffer(self.sncbuf[segid][1])
+                    snc.snc_free_packet(self.sncbuf[segid][2])
+                logging.info("[COOP] Nothing left to do. Exit...")
+                exit(0)
 
 
 if __name__ == "__main__":
@@ -616,14 +631,15 @@ if __name__ == "__main__":
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.settimeout(TIMEOUT)
     s.connect((serverhost, PORT))
-    pkt = Packet(MSG['CHK_FILE'], MetaInfo(filepath))
-    s.send(pickle.dumps(pkt))
-    reply = pickle.loads(s.recv(BUFSIZE))
-    if reply.mtype == MSG['FILEMETA']:
-        filemeta = reply.payload  # File meta information
+    pkt = CCPacket(CCHeader(MSG['CHK_FILE']), MetaInfo(filepath))
+    s.send(pkt.packed())
+    reply = CCPacket()
+    reply.parse(s.recv(BUFSIZE))
+    if reply.header.mtype == MSG['FILEMETA']:
+        filemeta = reply.body  # File meta information
         print(filemeta)
     else:
-        logging.info("[MAIN] Server returns message %s" % (iMSG[reply.mtype],))
+        logging.info("[MAIN] Server returns message %s" % (iMSG[reply.header.mtype],))
         s.close()
         exit(0)
     lastBeat = datetime.now()
@@ -639,11 +655,12 @@ if __name__ == "__main__":
         # Request file segment by segment
         # Get session information about the segment
         filemeta.segmentid = segid
-        pkt = Packet(MSG['REQ_SEG'], filemeta)
+        pkt = CCPacket(CCHeader(MSG['REQ_SEG']), filemeta)
         try:
-            s.send(pickle.dumps(pkt))
-            reply = pickle.loads(s.recv(BUFSIZE))
-            sessioninfo = reply.payload  # Session info
+            s.send(pkt.packed())
+            reply = CCPacket()
+            reply.parse(s.recv(BUFSIZE))
+            sessioninfo = reply.body  # Session info
             print(sessioninfo)
             # s.send(pickle.dumps(Packet(MSG['OK'], sessioninfo)))
         except Exception as detail:
@@ -652,9 +669,10 @@ if __name__ == "__main__":
             sys.exit(0)
         # Pass snc_parameters to sharing process, so that it creates
         # SNC packets buffer for the in-serving segment
-        pkt = Packet(MSG['NEW_SESSION'], sessioninfo)
+        pkt = CCPacket(CCHeader(MSG['NEW_SESSION']), sessioninfo)
+        logging.info("[MAIN] Sending NEW_SESSION to coop process")
         try:
-            coop.fdp.send(pkt)
+            coop.fdp.send(pkt.packed())
         except Exception as detail:
             logging.warning("[MAIN] Cannot send NEW_SESSION to coop process. Error: %s" % (detail, ))
         # Start receiving UDP data packets and decode the segment
@@ -670,10 +688,11 @@ if __name__ == "__main__":
         count_p = 0  # pkts from peers
         while not snc.snc_decoder_finished(decoder):
             if (datetime.now() - lastBeat).seconds > HB_INTVAL:
-                pkt = Packet(MSG['HEARTBEAT'], sessioninfo)
+                pkt = CCPacket(CCHeader(MSG['HEARTBEAT']), sessioninfo)
                 try:
-                    s.send(pickle.dumps(pkt))
-                    reply = pickle.loads(s.recv(BUFSIZE))
+                    s.send(pkt.packed())
+                    reply = CCPacket()
+                    reply.parse(s.recv(BUFSIZE))
                     lastBeat = datetime.now()
                 except Exception as detail:
                     logging.warning("[MAIN] Cannot connect to server. Error: %s", (detail, ))
@@ -681,7 +700,7 @@ if __name__ == "__main__":
                     # break
                 # Notify coop process to send heartbeat to peers
                 try:
-                    coop.fdp.send(pkt)
+                    coop.fdp.send(pkt.packed())
                 except Exception as detail:
                     logging.warning("[MAIN] Cannot notify coop process to heartbeat peers")
             # Receive data packets
@@ -691,20 +710,21 @@ if __name__ == "__main__":
                 continue
             if addr[0] != serverhost:
                 count_p += 1
+                logging.debug("[MAIN] An SNC packet from %s for segment %d " % (addr[0], segid))
             else:
                 count_s += 1
-                # print("An SNC packet from peer ", addr[0])
-                pkt = Packet(MSG['COOP_PKT'], copy.copy(data))
-                try:
-                    coop.fdp.send(pkt)  # Forward a copy to coop process
-                except Exception as detail:
-                    logging.warning("[MAIN] Cannot forward packet to coop process")
-                    if not child.is_alive():
-                        logging.info("[MAIN] Coop process is dead, exiting...")
-                        exit(1)
-                    else:
-                        logging.info("[MAIN] Coop process is still alive, but not reachable")
-            sncpkt_p.contents.deserialize(data, sp_ptr[0].size_g, sp_ptr[0].size_p, sp_ptr[0].bnc)
+            pkt = CCPacket()
+            pkt.parse(copy.copy(data))
+            try:
+                coop.fdp.send(pkt.packed())  # Forward a copy to coop process
+            except Exception as detail:
+                logging.warning("[MAIN] Cannot forward packet to coop process")
+                if not child.is_alive():
+                    logging.info("[MAIN] Coop process is dead, exiting...")
+                    exit(1)
+                else:
+                    logging.info("[MAIN] Coop process is still alive, but not reachable")
+            sncpkt_p.contents.deserialize(pkt.body, sp_ptr[0].size_g, sp_ptr[0].size_p, sp_ptr[0].bnc)
             snc.snc_process_packet(decoder, sncpkt_p)
 
         if snc.snc_decoder_finished(decoder):
@@ -712,16 +732,17 @@ if __name__ == "__main__":
                                     snc.snc_get_enc_context(decoder))
             logging.info("[MAIN] Finish segment %d" % (sessioninfo.segmentid,))
             # Request to stop the segment
-            pkt = Packet(MSG['REQ_STOP'], sessioninfo)
+            pkt = CCPacket(CCHeader(MSG['REQ_STOP']), sessioninfo)
             try:
-                s.send(pickle.dumps(pkt))
-                reply = pickle.loads(s.recv(BUFSIZE))
+                s.send(pkt.packed())
+                reply = CCPacket()
+                reply.parse(s.recv(BUFSIZE))
             except Exception as detail:
                 logging.warning("[MAIN] Cannot connect to server. Error: %s", (detail, ))
                 s.close()
-        pkt = Packet(MSG['END_SESSION'], sessioninfo)
+        pkt = CCPacket(CCHeader(MSG['END_SESSION']), sessioninfo)
         try:
-            coop.fdp.send(pkt)
+            coop.fdp.send(pkt.packed())
         except Exception as detail:
             logging.warning("[MAIN] Cannot send END_SESSION to coop process")
         snc.print_code_summary(snc.snc_get_enc_context(decoder),
@@ -732,17 +753,18 @@ if __name__ == "__main__":
         snc.snc_free_decoder(decoder)
         snc.snc_free_packet(sncpkt_p)
     logging.info("[MAIN] Finished")
-    pkt = Packet(MSG['EXIT'], sessioninfo)
+    pkt = CCPacket(CCHeader(MSG['EXIT']), sessioninfo)
     try:
-        s.send(pickle.dumps(pkt))
-        reply = pickle.loads(s.recv(BUFSIZE))
-        if reply.mtype  == MSG['OK']:
+        s.send(pkt.packed())
+        reply = CCPacket()
+        reply.parse(s.recv(BUFSIZE))
+        if reply.header.mtype  == MSG['EXIT_ACK']:
             logging.info("[MAIN] Server has acknowledged my exit.")
     except Exception as detail:
         logging.warning("[MAIN] Cannot connect to server. Error: %s", (detail, ))
     s.close()
     try:
-        coop.fdp.send(Packet(MSG['EXIT_PROC']))
+        coop.fdp.send(CCPacket(CCHeader(MSG['EXIT_PROC'])).packed())
     except Exception as detail:
         logging.warning("[MAIN] Cannot send EXIT_PROC to coop process. Error: %s", (detail, ))
     child.join()
